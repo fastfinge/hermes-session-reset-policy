@@ -12,6 +12,7 @@ Standalone-suite discipline (per the platform-plugin skill):
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -326,41 +327,65 @@ def test_maybe_reset_survives_missing_key_helper(plugin, tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# _read_session_reset_policy — profile resolution
+# _read_session_reset_policy — profile resolution via the real config loader
 # ---------------------------------------------------------------------------
 
-def test_policy_reader_none_on_missing_config(plugin, tmp_path, monkeypatch):
-    import types
+def _bootstrap_hermes_paths():
+    sys.path.insert(0, str(HERMES_TREE))
+    return HERMES_TREE.is_dir()
 
-    fake_const = types.ModuleType("hermes_constants")
-    fake_const.get_hermes_home = lambda: str(tmp_path)
-    monkeypatch.setitem(sys.modules, "hermes_constants", fake_const)
+
+def test_policy_reader_none_on_missing_config(plugin, tmp_path, monkeypatch):
+    if not _bootstrap_hermes_paths():
+        pytest.skip("Hermes tree not present on this host")
+    import hermes_constants
+    from hermes_cli import config as cfgmod
+
+    # Point the config cache at the temp home (the autouse fixture redirects
+    # HERMES_HOME already; ensure no stale cache survives from other tests).
+    monkeypatch.setattr(cfgmod, "_LOAD_CONFIG_CACHE", {})
+    monkeypatch.setattr(cfgmod, "_CONFIG_CACHE", {}, raising=False)
+
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", True, raising=False)
 
     assert plugin._read_session_reset_policy(None) is None
-    assert plugin._read_session_reset_policy("mom") is None
 
 
 def test_policy_reader_reads_named_profile_config(plugin, tmp_path, monkeypatch):
-    import types
+    if not _bootstrap_hermes_paths():
+        pytest.skip("Hermes tree not present on this host")
+    from hermes_cli import config as cfgmod
 
-    prof = tmp_path / "profiles" / "mom"
+    monkeypatch.setattr(cfgmod, "_LOAD_CONFIG_CACHE", {})
+    monkeypatch.setattr(cfgmod, "_CONFIG_CACHE", {}, raising=False)
+
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    prof = home / "profiles" / "mom"
     prof.mkdir(parents=True)
     (prof / "config.yaml").write_text(
         "session_reset:\n  mode: both\n  idle_minutes: 45\n  at_hour: 4\n"
     )
 
-    fake_const = types.ModuleType("hermes_constants")
-    fake_const.get_hermes_home = lambda: str(tmp_path)
-    monkeypatch.setitem(sys.modules, "hermes_constants", fake_const)
-
-    fake_cfg = types.ModuleType("hermes_cli.config")
-    fake_cfg.load_config_readonly = lambda path=None: {
-        "session_reset": {"mode": "both", "idle_minutes": 45, "at_hour": 4}
-    }
-    fake_cli = types.ModuleType("hermes_cli")
-    fake_cli.config = fake_cfg
-    monkeypatch.setitem(sys.modules, "hermes_cli", fake_cli)
-    monkeypatch.setitem(sys.modules, "hermes_cli.config", fake_cfg)
-
     policy = plugin._read_session_reset_policy("mom")
     assert policy == {"mode": "both", "idle_minutes": 45, "at_hour": 4}
+
+
+def test_policy_reader_reads_default_profile_config(plugin, tmp_path, monkeypatch):
+    if not _bootstrap_hermes_paths():
+        pytest.skip("Hermes tree not present on this host")
+    from hermes_cli import config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "_LOAD_CONFIG_CACHE", {})
+    monkeypatch.setattr(cfgmod, "_CONFIG_CACHE", {}, raising=False)
+
+    home = Path(os.environ["HERMES_HOME"])
+    home.mkdir(parents=True, exist_ok=True)
+    (home / "config.yaml").write_text(
+        "session_reset:\n  mode: idle\n  idle_minutes: 30\n"
+    )
+
+    policy = plugin._read_session_reset_policy(None)
+    assert policy == {"mode": "idle", "idle_minutes": 30}

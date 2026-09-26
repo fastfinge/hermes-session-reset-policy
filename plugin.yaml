@@ -1,7 +1,7 @@
 name: hermes-session-reset-policy
 label: Session Reset Policy
 kind: standalone
-version: 0.1.0
+version: 0.1.1
 description: >
   Re-arms Hermes Agent's config-declared session_reset policy (idle/daily/both)
   as a plugin, after upstream v2026.9.11 stopped rotating conversations on

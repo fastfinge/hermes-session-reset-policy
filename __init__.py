@@ -54,31 +54,38 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 
 def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any]]:
     """Return the ``session_reset`` block for *profile*, or None when unset/invalid.
 
-    Profile resolution mirrors the gateway's layout: default/None profile reads
-    ``<hermes_home>/config.yaml``; a named profile reads
-    ``<hermes_home>/profiles/<name>/config.yaml``. Never raises.
+    ``pre_gateway_dispatch`` fires before the per-profile runtime scope is
+    installed, so the ambient ``load_config_readonly()`` would read the launch
+    profile. Instead the profile's home (``<hermes_home>/profiles/<name>``) is
+    installed as a context-local hermes-home override — the same mechanism the
+    gateway uses for profile scoping — and the config cache is keyed by the
+    resolved config path, so each profile's block is read from its own
+    config.yaml. The returned dict is the SHARED cache object (readonly
+    variant): never mutated. Never raises.
     """
     try:
-        from hermes_constants import get_hermes_home
-
-        home = Path(get_hermes_home())
-        if profile and profile != "default":
-            cfg = home / "profiles" / profile / "config.yaml"
-        else:
-            cfg = home / "config.yaml"
-        if not cfg.is_file():
-            return None
+        from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
         from hermes_cli.config import load_config_readonly
 
-        config = load_config_readonly(path=str(cfg))
-        policy = (config or {}).get("session_reset") or {}
-        return policy if isinstance(policy, dict) else None
+        token = None
+        if profile and profile != "default":
+            profile_home = Path(get_hermes_home()) / "profiles" / profile
+            token = set_hermes_home_override(profile_home)
+        try:
+            config = load_config_readonly()
+        finally:
+            if token is not None:
+                reset_hermes_home_override(token)
+        policy = (config or {}).get("session_reset")
+        if not isinstance(policy, dict) or not policy:
+            return None  # unset/empty block: treat as "none", skip quietly
+        return policy
     except Exception:
         logger.debug("session_reset policy read failed; skipping", exc_info=True)
         return None
@@ -145,7 +152,7 @@ def _maybe_reset(event: Any, gateway: Any, session_store: Any) -> Optional[Dict[
     try:
         session_key = gateway._session_key_for_source(source)
     except Exception:
-        session_key = None
+        session_key = None  # never wedge dispatch on a key-derivation failure
     if session_key:
         try:
             entry = session_store.lookup_by_session_key(session_key)
@@ -162,10 +169,7 @@ def _maybe_reset(event: Any, gateway: Any, session_store: Any) -> Optional[Dict[
             "session-reset-policy: boundary '%s' reached for %s but a turn is in flight; deferring",
             reason, session_key,
         )
-        inbound_event = getattr(event, "internal", False)
-        if not inbound_event:
-            pass  # fall through to normal dispatch; next message re-evaluates
-        return None
+        return None  # normal dispatch; the next message re-evaluates
 
     try:
         new_entry = session_store.reset_session(session_key)
