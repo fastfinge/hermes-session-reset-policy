@@ -18,20 +18,37 @@ dispatch, the plugin:
    multiplexing the hook fires before the per-profile runtime scope is
    installed, so the profile home is resolved from ``event.source.profile``
    and the config is read directly from ``profiles/<name>/config.yaml``.
-3. Compares the routing entry's user-activity clock (``updated_at``, advanced
-   only by real user turns — internal events pass ``touch_activity=False``)
-   against the idle threshold and/or daily boundary.
+3. Compares the route's OWN user-activity clock — ``srp_last_user_inbound``
+   session metadata, advanced only by real user messages that reach this hook
+   — against the idle threshold and/or daily boundary. (Why not the entry's
+   ``updated_at``: turn-start stamps it for EVERY turn, including internal
+   background-review turns, so on an idle gateway where reviews chain the
+   clock never goes stale and the idle reset can never fire. Slash commands
+   such as ``/status`` also stamp ``updated_at`` while never reaching this
+   hook — they are bookkeeping, not conversation.)
 4. If past the boundary and no turn is currently in flight for that session,
    calls ``SessionStore.reset_session(session_key)`` — the same store path the
    ``/new`` command uses — so the new conversation starts on a fresh
    session id with the route, transcript end, and state.db row handled by the
    store's own transition logic.
+5. Otherwise records this message's arrival time as the new clock value
+   (via ``set_session_metadata``, which deliberately does not touch
+   ``updated_at``).
+
+Migration: routes that predate the plugin have no metadata clock; their first
+hook-seen message falls back to ``updated_at``/``created_at`` once, then the
+metadata clock takes over.
 
 Because the reset happens lazily on the first *inbound message* past the
 boundary (not on a timer), a session that goes idle is simply continued when
 the user comes back within the threshold, and reset exactly once when they
-come back after it. Internal/cron traffic never passes through this hook, so
-background activity can never keep a session alive nor reset it.
+come back after it. Internal/cron traffic and slash commands never pass
+through this hook, so background activity can never keep a session alive nor
+reset it — and can no longer keep one *un-reset* either.
+
+Deferral semantics: when the boundary is past but a turn is in flight, the
+clock is NOT advanced, so the next message re-evaluates the same boundary
+against the same last-user-inbound time.
 
 Compatibility notes
 -------------------
@@ -47,14 +64,15 @@ Compatibility notes
 from __future__ import annotations
 
 import logging
-import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.1.1"
+__version__ = "0.2.0"
+
+_META_KEY = "srp_last_user_inbound"
 
 
 def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -91,21 +109,48 @@ def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any
         return None
 
 
-def _time_reset_reason(policy: Dict[str, Any], entry: Any, now: datetime) -> Optional[str]:
-    """Return "idle"/"daily" when *entry* is past the policy boundary, else None.
+def _parse_iso(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    return None
 
-    Ported from the local session_lifecycle patch: idle compares against the
-    entry's user-activity clock (``updated_at`` falling back to ``created_at``);
-    daily fires on the first activity after the configured local hour. Fails
-    open (None) on any malformed value.
+
+def _last_user_inbound(entry: Any) -> Optional[datetime]:
+    """The route's user-activity clock.
+
+    Order: the plugin's own ``srp_last_user_inbound`` metadata (written only by
+    messages that reach this hook), then ``updated_at``/``created_at`` as a
+    one-time migration fallback for routes that predate the plugin.
+    """
+    meta = getattr(entry, "metadata", None) or {}
+    stamp = _parse_iso(meta.get(_META_KEY)) if isinstance(meta, dict) else None
+    if stamp is not None:
+        return stamp
+    return getattr(entry, "updated_at", None) or getattr(entry, "created_at", None)
+
+
+def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: datetime) -> Optional[str]:
+    """Return "idle"/"daily" when *last* user activity is past the policy boundary, else None.
+
+    Idle compares the user-activity clock against the threshold; daily fires on
+    the first activity after the configured local hour. Fails open (None) on
+    any malformed value.
     """
     try:
         mode = str(policy.get("mode") or "none")
         if mode == "none":
             return None
-        last = entry.updated_at or entry.created_at
         if last is None:
             return None
+        if not isinstance(last, datetime):
+            last = _parse_iso(last)
+            if last is None:
+                return None
         if mode in ("idle", "both"):
             idle_minutes = policy.get("idle_minutes")
             if isinstance(idle_minutes, (int, float)) and idle_minutes > 0:
@@ -161,15 +206,22 @@ def _maybe_reset(event: Any, gateway: Any, session_store: Any) -> Optional[Dict[
     if entry is None:
         return None  # no route yet -> brand-new conversation anyway
 
-    reason = _time_reset_reason(policy, entry, datetime.now())
+    now = datetime.now()
+    reason = _time_reset_reason(policy, _last_user_inbound(entry), now)
     if reason is None:
+        # Not past the boundary: this message IS the user activity — advance
+        # our own clock (never ``updated_at``; see module docstring).
+        try:
+            session_store.set_session_metadata(session_key, _META_KEY, now.isoformat())
+        except Exception:
+            logger.debug("session_reset clock stamp failed", exc_info=True)
         return None
     if _session_in_flight(entry):
         logger.info(
-            "session-reset-policy: boundary '%s' reached for %s but a turn is in flight; deferring",
+            "session-reset-policy: boundary '%s' reached for %s but a turn is in flight; deferring (clock NOT advanced)",
             reason, session_key,
         )
-        return None  # normal dispatch; the next message re-evaluates
+        return None  # normal dispatch; the next message re-evaluates the same boundary
 
     try:
         new_entry = session_store.reset_session(session_key)

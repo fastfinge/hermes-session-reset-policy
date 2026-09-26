@@ -80,6 +80,13 @@ def plugin():
 NOW = datetime(2026, 9, 26, 12, 0, 0)
 
 
+def _last(updated_minutes_ago):
+    """A user-activity clock value N minutes before NOW."""
+    if updated_minutes_ago is None:
+        return None
+    return NOW - timedelta(minutes=updated_minutes_ago)
+
+
 def _entry(updated_minutes_ago: float, *, token=None):
     from dataclasses import dataclass, field
 
@@ -96,17 +103,17 @@ def _entry(updated_minutes_ago: float, *, token=None):
 
 def test_idle_mode_triggers_past_threshold(plugin):
     policy = {"mode": "idle", "idle_minutes": 60}
-    assert plugin._time_reset_reason(policy, _entry(90), NOW) == "idle"
+    assert plugin._time_reset_reason(policy, _last(90), NOW) == "idle"
 
 
 def test_idle_mode_no_reset_within_threshold(plugin):
     policy = {"mode": "idle", "idle_minutes": 60}
-    assert plugin._time_reset_reason(policy, _entry(30), NOW) is None
+    assert plugin._time_reset_reason(policy, _last(30), NOW) is None
 
 
 def test_idle_mode_exactly_at_threshold_triggers(plugin):
     policy = {"mode": "idle", "idle_minutes": 60}
-    assert plugin._time_reset_reason(policy, _entry(60), NOW) == "idle"
+    assert plugin._time_reset_reason(policy, _last(60), NOW) == "idle"
 
 
 def test_daily_mode_boundary(plugin):
@@ -116,13 +123,9 @@ def test_daily_mode_boundary(plugin):
         created_at=datetime(2026, 9, 25, 10, 0),
         updated_at=datetime(2026, 9, 25, 10, 0),
     )
-    assert plugin._time_reset_reason(policy, entry, NOW) == "daily"
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 25, 10, 0), NOW) == "daily"
     # last after today's boundary -> no reset
-    entry2 = SimpleNamespace(
-        created_at=datetime(2026, 9, 26, 8, 0),
-        updated_at=datetime(2026, 9, 26, 8, 0),
-    )
-    assert plugin._time_reset_reason(policy, entry2, NOW) is None
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 8, 0), NOW) is None
 
 
 def test_daily_mode_boundary_in_future_rolls_back_a_day(plugin):
@@ -134,43 +137,40 @@ def test_daily_mode_boundary_in_future_rolls_back_a_day(plugin):
         created_at=datetime(2026, 9, 25, 12, 0),
         updated_at=datetime(2026, 9, 25, 12, 0),
     )
-    assert plugin._time_reset_reason(policy, entry, now) is None
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 25, 12, 0), now) is None
     # last=day-before-yesterday -> reset
-    entry2 = SimpleNamespace(
-        created_at=datetime(2026, 9, 24, 12, 0),
-        updated_at=datetime(2026, 9, 24, 12, 0),
-    )
-    assert plugin._time_reset_reason(policy, entry2, now) == "daily"
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 24, 12, 0), now) == "daily"
 
 
 def test_both_mode_idle_wins_first(plugin):
     policy = {"mode": "both", "idle_minutes": 30, "at_hour": 4}
-    assert plugin._time_reset_reason(policy, _entry(90), NOW) == "idle"
+    assert plugin._time_reset_reason(policy, _last(90), NOW) == "idle"
 
 
 def test_none_mode_never_triggers(plugin):
     policy = {"mode": "none"}
-    assert plugin._time_reset_reason(policy, _entry(100000), NOW) is None
+    assert plugin._time_reset_reason(policy, _last(100000), NOW) is None
 
 
 def test_malformed_policy_fails_open(plugin):
     for policy in ({"mode": "idle", "idle_minutes": "lots"}, {"mode": "daily", "at_hour": 99}, {}):
-        assert plugin._time_reset_reason(policy, _entry(90), NOW) is None
+        assert plugin._time_reset_reason(policy, _last(90), NOW) is None
 
 
 def test_missing_timestamps_no_reset(plugin):
     policy = {"mode": "idle", "idle_minutes": 1}
-    entry = SimpleNamespace(created_at=None, updated_at=None)
-    assert plugin._time_reset_reason(policy, entry, NOW) is None
+    assert plugin._time_reset_reason(policy, None, NOW) is None
 
 
 def test_created_at_fallback(plugin):
+    # Migration path: entry without metadata clock falls back to created_at
     policy = {"mode": "idle", "idle_minutes": 60}
     entry = SimpleNamespace(
         created_at=NOW - timedelta(minutes=90),
         updated_at=None,
+        metadata={},
     )
-    assert plugin._time_reset_reason(policy, entry, NOW) == "idle"
+    assert plugin._time_reset_reason(policy, plugin._last_user_inbound(entry), NOW) == "idle"
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +240,7 @@ def test_maybe_reset_calls_real_reset_session(plugin, tmp_path):
     event = SimpleNamespace(source=_real_source(), internal=False)
 
     policy = {"mode": "idle", "idle_minutes": 60}
-    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy), \
-         mock.patch.object(plugin, "datetime") as fake_dt:
-        fake_dt.now.return_value = datetime.now()
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         result = plugin._maybe_reset(event, gateway, store)
 
     assert result is None  # allow normal dispatch
@@ -250,6 +248,63 @@ def test_maybe_reset_calls_real_reset_session(plugin, tmp_path):
     assert new_entry is not None
     assert new_entry.session_id != "seed-sid"
     assert new_entry.is_fresh_reset is True
+
+
+def test_maybe_reset_bg_turn_does_not_block_reset(plugin, tmp_path):
+    """The 19:04 bug: a background-review turn stamps ``updated_at`` but must
+    NOT reset the plugin's own clock. An old last-user-inbound with a fresh
+    ``updated_at`` must still reset."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=1)  # fresh updated_at
+    # But the plugin's clock says the last real user inbound was 2h ago:
+    store.set_session_metadata(key, "srp_last_user_inbound",
+                               (datetime.now() - timedelta(hours=2)).isoformat())
+
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert plugin._maybe_reset(event, gateway, store) is None
+
+    new_entry = store.lookup_by_session_key(key)
+    assert new_entry.session_id != "seed-sid"
+    assert new_entry.is_fresh_reset is True
+
+
+def test_maybe_reset_stamps_clock_when_within_threshold(plugin, tmp_path):
+    """Within the threshold the message must advance the plugin's own clock,
+    not ``updated_at``."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=5)
+
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    before = datetime.now() - timedelta(seconds=5)
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert plugin._maybe_reset(event, gateway, store) is None
+
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    stamp = store.get_session_metadata(key, "srp_last_user_inbound")
+    assert stamp is not None
+    assert datetime.fromisoformat(stamp) >= before
+
+
+def test_maybe_reset_deferral_does_not_advance_clock(plugin, tmp_path):
+    """Boundary past + turn in flight: defer AND leave the clock alone, so the
+    next message re-evaluates the same boundary."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120, token="tok-123")
+
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert plugin._maybe_reset(event, gateway, store) is None
+
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    # No clock stamp: the deferral must not swallow the pending reset.
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
 
 
 def test_maybe_reset_skips_when_within_threshold(plugin, tmp_path):
