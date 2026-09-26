@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  # The integration tests import the real gateway SessionStore/SessionEntry.
+  # Pinned to the canary commit the plugin was developed against
+  # (v0.21.4+canary.20260925T065930Z-24-g59004a6235); bump deliberately and
+  # re-run locally against the new tree before moving it.
+  HERMES_REF: 59004a62356f3a4697ab0fe8ad5086d2b405e2a6
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.13", "3.14"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Clone pinned Hermes tree
+        # tests/test_session_reset_policy.py resolves the tree at
+        # ~/.hermes/hermes-agent; tests skip (not fail) if it is absent.
+        run: |
+          mkdir -p ~/.hermes
+          git clone --filter=blob:none --no-checkout \
+            https://github.com/NousResearch/hermes-agent.git ~/.hermes/hermes-agent
+          git -C ~/.hermes/hermes-agent checkout $HERMES_REF
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Run test suite
+        # Deliberately no PYTHONPATH for the plugin checkout itself: the
+        # standalone-suite discipline is that collection must work without
+        # Hermes imports. The hermes tree enters sys.path lazily inside the
+        # real-store tests only.
+        run: python -m pytest tests/ -q

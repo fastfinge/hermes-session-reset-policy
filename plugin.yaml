@@ -1,0 +1,14 @@
+name: hermes-session-reset-policy
+label: Session Reset Policy
+kind: standalone
+version: 0.1.0
+description: >
+  Re-arms Hermes Agent's config-declared session_reset policy (idle/daily/both)
+  as a plugin, after upstream v2026.9.11 stopped rotating conversations on
+  timers. On the first inbound message past an idle threshold or daily boundary,
+  the plugin resets the conversation via SessionStore.reset_session() so the
+  user-activity clock (entry.updated_at, advanced only by real user turns) is
+  the only trigger. No timers, no background writes. Publishes reset decisions
+  through the same store hook the /new command uses, so transcripts, routing,
+  and state.db stay consistent.
+author: Samuel Proulx / fastfinge

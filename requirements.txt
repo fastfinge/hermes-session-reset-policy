@@ -1,0 +1,2 @@
+# Runtime dependencies: none — the plugin is pure stdlib and imports Hermes
+# internals lazily from the running gateway process.
