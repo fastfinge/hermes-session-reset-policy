@@ -1,3 +1,6 @@
 pytest
 pyyaml
 ruamel.yaml
+# Imported transitively by the Hermes-tree modules the tests bind the real
+# /new funnel from (gateway.slash_commands_session -> gateway.platforms.base).
+httpx

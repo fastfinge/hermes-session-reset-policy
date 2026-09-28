@@ -6,11 +6,12 @@ on:
   pull_request:
 
 env:
-  # The integration tests import the real gateway SessionStore/SessionEntry.
-  # Pinned to the canary commit the plugin was developed against
-  # (v0.21.4+canary.20260925T065930Z-24-g59004a6235); bump deliberately and
-  # re-run locally against the new tree before moving it.
-  HERMES_REF: 59004a62356f3a4697ab0fe8ad5086d2b405e2a6
+  # The integration tests import the real gateway SessionStore/SessionEntry
+  # and bind the real /new reset funnel (GatewaySessionCommandsMixin).
+  # Pinned to hermes-agent main as of 2026-09-27 (9a0a1625); the full suite
+  # was re-run locally against this tree. Bump deliberately and re-run
+  # locally against the new tree before moving it.
+  HERMES_REF: 9a0a1625367242596d338ae2da541c4a1fc785a2
 
 jobs:
   pytest:
@@ -26,14 +27,23 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Clone pinned Hermes tree
+      - name: Fetch pinned Hermes tree
         # tests/test_session_reset_policy.py resolves the tree at
         # ~/.hermes/hermes-agent; tests skip (not fail) if it is absent.
+        # actions/checkout fetches WITH the workflow token — the previous
+        # anonymous `git clone` kept hitting GitHub's unauthenticated rate
+        # limit (HTTP 429) and failing whole runs on this step.
+        uses: actions/checkout@v4
+        with:
+          repository: NousResearch/hermes-agent
+          ref: ${{ env.HERMES_REF }}
+          path: hermes-agent-src
+          fetch-depth: 1
+
+      - name: Place Hermes tree at ~/.hermes/hermes-agent
         run: |
           mkdir -p ~/.hermes
-          git clone --filter=blob:none --no-checkout \
-            https://github.com/NousResearch/hermes-agent.git ~/.hermes/hermes-agent
-          git -C ~/.hermes/hermes-agent checkout $HERMES_REF
+          mv "$GITHUB_WORKSPACE/hermes-agent-src" ~/.hermes/hermes-agent
 
       - name: Install dependencies
         run: |
