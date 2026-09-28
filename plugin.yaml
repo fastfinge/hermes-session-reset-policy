@@ -12,3 +12,5 @@ description: >
   through the same store hook the /new command uses, so transcripts, routing,
   and state.db stay consistent.
 author: Samuel Proulx / fastfinge
+provides_hooks:
+  - pre_gateway_dispatch
