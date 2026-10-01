@@ -92,7 +92,6 @@ import dataclasses
 import inspect
 import logging
 from datetime import datetime, timedelta
-from pathlib import Path
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
@@ -107,21 +106,25 @@ def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any
 
     ``pre_gateway_dispatch`` fires before the per-profile runtime scope is
     installed, so the ambient ``load_config_readonly()`` would read the launch
-    profile. Instead the profile's home (``<hermes_home>/profiles/<name>``) is
-    installed as a context-local hermes-home override — the same mechanism the
-    gateway uses for profile scoping — and the config cache is keyed by the
-    resolved config path, so each profile's block is read from its own
-    config.yaml. The returned dict is the SHARED cache object (readonly
-    variant): never mutated. Never raises.
+    profile. Instead the profile's home is installed as a context-local
+    hermes-home override — the same mechanism the gateway uses for profile
+    scoping — and the config cache is keyed by the resolved config path, so
+    each profile's block is read from its own config.yaml. The home is
+    resolved via :func:`hermes_cli.profiles.get_profile_dir`, which anchors
+    names to the Hermes ROOT (not the current home) and handles ``default``
+    as the root itself: a standalone gateway may run with ``HERMES_HOME``
+    already set to its own profile dir, where ``<home>/profiles/<name>`` would
+    double-nest and find nothing (issue #4). The returned dict is the SHARED
+    cache object (readonly variant): never mutated. Never raises.
     """
     try:
-        from hermes_constants import get_hermes_home, set_hermes_home_override, reset_hermes_home_override
+        from hermes_constants import set_hermes_home_override, reset_hermes_home_override
         from hermes_cli.config import load_config_readonly
+        from hermes_cli.profiles import get_profile_dir
 
         token = None
-        if profile and profile != "default":
-            profile_home = Path(get_hermes_home()) / "profiles" / profile
-            token = set_hermes_home_override(profile_home)
+        if profile:
+            token = set_hermes_home_override(get_profile_dir(profile))
         try:
             config = load_config_readonly()
         finally:

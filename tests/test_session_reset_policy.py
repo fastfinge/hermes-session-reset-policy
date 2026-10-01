@@ -48,6 +48,20 @@ def _temp_hermes_home(tmp_path, monkeypatch):
     the guard passes because the temp root is not the platform default.
     """
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes-home"))
+    # Hermetic root inference (issue #4 repro exposed this): on hosts whose
+    # TMPDIR sits under the native ~/.hermes (e.g. the Hermes scratch dir),
+    # pytest tmp roots read as part of the DEFAULT profile tree — root
+    # inference then anchors at ~/.hermes and profile-name resolution
+    # (hermes_cli.profiles.get_profile_dir) escapes the sandbox into the LIVE
+    # profiles/ dir. Shift the platform-default suffix so every tmp root is a
+    # self-contained external root.
+    monkeypatch.setenv("HERMES_DATA_DIR_SUFFIX", f"/pytest-{tmp_path.name}")
+    try:
+        import hermes_constants
+        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+        monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", True, raising=False)
+    except Exception:
+        pass  # tree not importable here: the tests skip anyway
 
 
 @pytest.fixture(autouse=True)
@@ -650,3 +664,60 @@ def test_policy_reader_reads_default_profile_config(plugin, tmp_path, monkeypatc
 
     policy = plugin._read_session_reset_policy(None)
     assert policy == {"mode": "idle", "idle_minutes": 30}
+
+def _write_idle_policy(config_dir: Path, minutes: int) -> None:
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "config.yaml").write_text(
+        f"session_reset:\n  mode: idle\n  idle_minutes: {minutes}\n", encoding="utf-8"
+    )
+
+def test_policy_reader_resolves_profiles_from_root(plugin, tmp_path, monkeypatch):
+    """Issue #4 regression: profile tags resolve against the Hermes ROOT under
+    BOTH gateway layouts — a multiplexed gateway (HERMES_HOME = <root>) and a
+    standalone per-profile gateway (HERMES_HOME = <root>/profiles/<name>). The
+    old ``<home>/profiles/<name>`` build double-nested on the standalone layout
+    (looking for ``profiles/alpha/profiles/alpha/config.yaml``) and the reader
+    silently returned None, so no reset ever fired.
+
+    ``default`` is just a profile name too: its home IS the root, whatever the
+    launch home is (same mapping hermes_cli.profiles.get_profile_dir encodes).
+    """
+    if not _bootstrap_hermes_paths():
+        pytest.skip("Hermes tree not present on this host")
+    import hermes_constants
+    from hermes_cli import config as cfgmod
+
+    # External/custom-root layout (the reporter's per-profile gateways, cf. a
+    # Docker /opt/data root): shift the native-home suffix so the tmp root is
+    # not absorbed into the default profile tree's root inference.
+    monkeypatch.setenv("HERMES_DATA_DIR_SUFFIX", f"/srp-test-{tmp_path.name}")
+    monkeypatch.setattr(hermes_constants, "_profile_fallback_warned", True, raising=False)
+
+    root = tmp_path / "root"
+    _write_idle_policy(root, 111)                    # the "default" profile
+    _write_idle_policy(root / "profiles" / "alpha", 222)
+    _write_idle_policy(root / "profiles" / "beta", 333)
+
+    cases = [
+        # per-profile home (standalone gateway per profile)
+        (root / "profiles" / "alpha", "alpha", 222),
+        (root / "profiles" / "alpha", "beta", 333),
+        (root / "profiles" / "alpha", None, 222),
+        (root / "profiles" / "beta", "beta", 333),
+        # root home (multiplexed gateway)
+        (root, "alpha", 222),
+        (root, "beta", 333),
+        (root, "default", 111),
+        (root, None, 111),
+        # "default" names the root profile's config, even from a profile home
+        (root / "profiles" / "alpha", "default", 111),
+    ]
+    for home, profile, minutes in cases:
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr(hermes_constants, "_default_hermes_root_memo", None)
+        monkeypatch.setattr(cfgmod, "_LOAD_CONFIG_CACHE", {})
+        monkeypatch.setattr(cfgmod, "_CONFIG_CACHE", {}, raising=False)
+        policy = plugin._read_session_reset_policy(profile)
+        assert policy == {"mode": "idle", "idle_minutes": minutes}, (
+            f"HERMES_HOME={home} profile={profile!r} -> {policy}"
+        )

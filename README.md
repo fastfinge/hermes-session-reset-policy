@@ -22,9 +22,12 @@ message, before auth and dispatch, it:
    layouts match exactly. (No bare `build_session_key` fallback on purpose:
    under multiplexed profiles that key is not profile-namespaced and could
    resolve another profile's route for the same chat.)
-2. Reads the profile's `config.yaml` `session_reset` block (under
-   `multiplex_profiles`, the profile is resolved from the message's
-   `source.profile` and read from `profiles/<name>/config.yaml`).
+2. Reads the profile's `config.yaml` `session_reset` block (the profile is
+   resolved from the message's `source.profile` through Hermes' own
+   `get_profile_dir`, anchored at the Hermes *root* so both gateway layouts
+   read the right file: one multiplexed gateway at the root, or a standalone
+   gateway per profile running with `HERMES_HOME` set to its own
+   `profiles/<name>` dir — see issue #4).
 3. Compares the routing entry's user-activity clock — the plugin's own
    `srp_last_user_inbound` session metadata, advanced only by messages that
    reach this hook (slash commands and internal/cron traffic never do) —
