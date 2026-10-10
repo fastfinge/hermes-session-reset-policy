@@ -721,3 +721,94 @@ def test_policy_reader_resolves_profiles_from_root(plugin, tmp_path, monkeypatch
         assert policy == {"mode": "idle", "idle_minutes": minutes}, (
             f"HERMES_HOME={home} profile={profile!r} -> {policy}"
         )
+
+
+# ---------------------------------------------------------------------------
+# Slash commands: skipped by the hook (no clock stamp, no time reset)
+# ---------------------------------------------------------------------------
+
+def _real_event(text):
+    """A real gateway MessageEvent (its get_command() is the router's parse)."""
+    event_mod = _import_tree_module("gateway.platforms.event")
+    return event_mod.MessageEvent(text=text, source=_real_source())
+
+
+@pytest.mark.parametrize("text", ["/new", "/reset", "/status", "  /model some-model"])
+def test_maybe_reset_skips_slash_commands_past_boundary(plugin, tmp_path, text):
+    """The gateway runs pre_gateway_dispatch for commands too (every
+    non-internal event, before command routing): the hook must not rotate."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120)
+    funnel = mock.AsyncMock(side_effect=AssertionError("a command must not trigger a time reset"))
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key, _handle_reset_command=funnel)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy), \
+         mock.patch.object(store, "reset_session",
+                           side_effect=AssertionError("store must not rotate for a command")):
+        assert _run(plugin._maybe_reset(_real_event(text), gateway, store)) is None
+
+    assert not funnel.called
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    # Deferral semantics hold: the clock is untouched, the next real message resets.
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+
+
+def test_maybe_reset_command_does_not_stamp_clock(plugin, tmp_path):
+    """Within the threshold a command is bookkeeping, not user activity: a
+    periodic /status must not keep an otherwise idle session alive."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=5)
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(_real_event("/status"), gateway, store)) is None
+
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+
+
+def test_command_check_falls_back_to_text_without_get_command(plugin):
+    """Event stand-ins without get_command(): a leading "/" (after whitespace)."""
+    assert plugin._is_slash_command(SimpleNamespace(text="  /new")) is True
+    assert plugin._is_slash_command(SimpleNamespace(text="hello /new")) is False
+    assert plugin._is_slash_command(SimpleNamespace(text=None)) is False
+    assert plugin._is_slash_command(SimpleNamespace()) is False
+
+
+def test_path_like_message_is_not_a_command(plugin, tmp_path):
+    """get_command() rejects path-like text: it is an ordinary message and the
+    time reset still applies to it."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120)
+    seen = []
+
+    async def funnel(evt):
+        seen.append(evt)
+
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key, _handle_reset_command=funnel)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(_real_event("/etc/hosts is broken"), gateway, store)) is None
+
+    assert len(seen) == 1
+
+
+def test_new_past_boundary_rotates_once_with_real_funnel(plugin, tmp_path, hook_recorder, monkeypatch):
+    """Regression: /new sent past the boundary rotated the route TWICE (the hook
+    with reason=idle, then the command), burning a run generation and leaving
+    an empty, already-ended session row. Hook first, then the command, as the
+    gateway orders them: exactly one rotation."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120)
+    gw, calls, slash_mod = _real_funnel_gateway(store, key)
+    monkeypatch.setattr(slash_mod, "t", lambda key_name, **kw: key_name)  # no i18n in tests
+    event = _real_event("/new")
+
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None  # pre_gateway_dispatch
+        _run(gw._handle_reset_command(event))  # the gateway then routes /new
+
+    assert calls.invalidated == [(key, "session_reset")]
+    assert [name for name, _ in gw.hooks.emitted] == ["session:end", "session:reset"]
+    assert calls.finalize and calls.finalize[0]["session_id"] == "seed-sid"
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"
