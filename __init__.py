@@ -24,8 +24,8 @@ dispatch, the plugin:
    ``updated_at``: turn-start stamps it for EVERY turn, including internal
    background-review turns, so on an idle gateway where reviews chain the
    clock never goes stale and the idle reset can never fire. Slash commands
-   such as ``/status`` also stamp ``updated_at`` while never reaching this
-   hook — they are bookkeeping, not conversation.)
+   such as ``/status`` also stamp ``updated_at`` — they are bookkeeping, not
+   conversation, and this hook skips them: see "Slash commands" below.)
 4. If past the boundary and no turn is currently in flight for that session,
    resets the conversation through the gateway's OWN ``/new`` reset funnel
    (``gateway._handle_reset_command``, fed a text-free event): the exact path
@@ -57,9 +57,22 @@ metadata clock takes over.
 Because the reset happens lazily on the first *inbound message* past the
 boundary (not on a timer), a session that goes idle is simply continued when
 the user comes back within the threshold, and reset exactly once when they
-come back after it. Internal/cron traffic and slash commands never pass
-through this hook, so background activity can never keep a session alive nor
-reset it — and can no longer keep one *un-reset* either.
+come back after it. Internal/cron traffic never passes through this hook and
+slash commands are skipped by it, so background activity can never keep a
+session alive nor reset it — and can no longer keep one *un-reset* either.
+
+Slash commands
+--------------
+The gateway DOES run ``pre_gateway_dispatch`` for slash commands: it fires
+for every non-internal event, before command routing. The hook therefore
+skips commands explicitly (``event.get_command()``; a bare leading ``/`` for
+events without that helper). A command neither advances the user-activity
+clock nor triggers a time reset. Without the skip, a ``/new`` or ``/reset``
+sent past the boundary rotated the route TWICE: once here, then once more by
+the command itself. That burned a run generation and left an empty,
+already-ended session row behind. Message text that only looks like a path
+(``/etc/hosts is broken``) is not a command (``get_command()`` rejects it)
+and is handled as an ordinary message.
 
 Deferral semantics: when the boundary is past but a turn is in flight, the
 clock is NOT advanced, so the next message re-evaluates the same boundary
@@ -219,6 +232,24 @@ def _lookup_entry(session_store: Any, session_key: Optional[str]) -> Any:
         return None
 
 
+def _is_slash_command(event: Any) -> bool:
+    """True when *event* is a gateway slash command (``/new``, ``/status``, ...).
+
+    Uses the event's own ``get_command()`` when present: the same parse the
+    gateway's command router uses, which honours ``allow_gateway_control`` and
+    rejects path-like text (``/etc/hosts is broken``). Events without that
+    helper fall back to a leading ``/`` on their text. Never raises.
+    """
+    get_command = getattr(event, "get_command", None)
+    if callable(get_command):
+        try:
+            return bool(get_command())
+        except Exception:
+            logger.debug("session-reset-policy: get_command() failed; using the text check", exc_info=True)
+    text = getattr(event, "text", None)
+    return isinstance(text, str) and text.lstrip().startswith("/")
+
+
 def _resolve_session_key(gateway: Any, source: Any, from_payload: Optional[str]) -> Optional[str]:
     """The routing key for *source*: the hook payload's ``session_key`` when a
     future Hermes exposes one publicly, else ``gateway._session_key_for_source``.
@@ -342,6 +373,11 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         return None
     source = getattr(event, "source", None)
     if source is None:
+        return None
+    if _is_slash_command(event):
+        # Bookkeeping, not conversation (module docstring, "Slash commands"):
+        # no clock stamp, no time reset. /new and /reset rotate the route
+        # themselves; resetting here first would rotate it twice.
         return None
 
     profile = getattr(source, "profile", None)
