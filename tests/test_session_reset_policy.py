@@ -137,7 +137,7 @@ def _entry(updated_minutes_ago: float, *, token=None):
         created_at: datetime = NOW - timedelta(minutes=updated_minutes_ago or 1)
         updated_at: datetime = NOW - timedelta(minutes=updated_minutes_ago or 1)
         active_turn_token: str | None = token
-        session_key: str = "agent:main:local:dm:test"
+        session_key: str = "agent:main:telegram:dm:test"
         session_id: str = "s-1"
 
     return Entry()
@@ -262,10 +262,13 @@ def _make_real_store(tmp_path):
 def _real_source():
     mod = _import_tree_module("gateway.session")
     cfg = _import_tree_module("gateway.config")
-    return mod.SessionSource(platform=cfg.Platform.LOCAL, chat_id="test-chat", chat_type="dm",
+    # A chat platform, not LOCAL: from the Hermes session-authority runtime (v0.23) on, a LOCAL
+    # route rotates only under the authority epoch a running gateway installs, so a bare store
+    # cannot reset one. Chat routes are what this plugin resets anyway.
+    return mod.SessionSource(platform=cfg.Platform.TELEGRAM, chat_id="test-chat", chat_type="dm",
                              user_id="tester")
 
-def _seed_route(store, *, key="agent:main:local:dm:test-chat", updated_minutes_ago=0.0, token=None):
+def _seed_route(store, *, key="agent:main:telegram:dm:test-chat", updated_minutes_ago=0.0, token=None):
     mod = _import_tree_module("gateway.session")
     SessionEntry = mod.SessionEntry
     src = _real_source()
@@ -390,8 +393,8 @@ def test_maybe_reset_prefers_payload_session_key(plugin, tmp_path):
     """A public session_key in the hook payload outranks the private gateway
     helper (review #2, item 4: ready for the payload equivalent they offered)."""
     store = _make_real_store(tmp_path)
-    payload_key = "agent:main:local:dm:payload-chat"
-    helper_key = "agent:main:local:dm:helper-chat"
+    payload_key = "agent:main:telegram:dm:payload-chat"
+    helper_key = "agent:main:telegram:dm:helper-chat"
     _seed_route(store, key=payload_key, updated_minutes_ago=5)
     _seed_route(store, key=helper_key, updated_minutes_ago=5)
     gateway = SimpleNamespace(_session_key_for_source=lambda src: helper_key)
@@ -493,7 +496,7 @@ def test_maybe_reset_survives_store_errors(plugin, tmp_path):
         def lookup_by_session_key(self, key):
             raise RuntimeError("boom")
 
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: "agent:main:local:dm:x")
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: "agent:main:telegram:dm:x")
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -501,7 +504,7 @@ def test_maybe_reset_survives_store_errors(plugin, tmp_path):
 
 def test_maybe_reset_no_route_no_op(plugin, tmp_path):
     store = _make_real_store(tmp_path)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: "agent:main:local:dm:none")
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: "agent:main:telegram:dm:none")
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -540,7 +543,7 @@ def _real_funnel_gateway(store, key):
     slash_mod = _import_tree_module("gateway.slash_commands_session")
     mixin = slash_mod.GatewaySessionCommandsMixin
 
-    calls = SimpleNamespace(invalidated=[], released=[], evicted=[], cleared=[], finalize=[])
+    calls = SimpleNamespace(invalidated=[], released=[], evicted=[], cleared=[], finalize=[], stopped=[])
 
     class _Hooks:
         def __init__(self):
@@ -566,6 +569,11 @@ def _real_funnel_gateway(store, key):
     gw._telegram_topic_new_header = lambda source: ""
     gw._is_telegram_topic_lane = lambda source: False
     gw._session_db = None
+    # v0.23's funnel first stops the route owner's turn through the session authority; with no
+    # authority that is a no-op, so a recorder stands in.
+    async def _hm_stop_owner_turn(k):
+        calls.stopped.append(k)
+    gw._hm_stop_owner_turn = _hm_stop_owner_turn
     for name in ("_handle_reset_command", "_fire_session_reset_hooks",
                  "_cleanup_old_agent_for_reset"):
         setattr(gw, name, getattr(mixin, name).__get__(gw))
