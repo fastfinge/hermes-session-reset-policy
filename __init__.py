@@ -406,6 +406,7 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         )
         return None  # normal dispatch; the next message re-evaluates the same boundary
 
+    old_sid = getattr(entry, "session_id", None)
     try:
         new_entry = await _reset_session(gateway, event, source, session_store, key)
     except Exception:
@@ -414,12 +415,36 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
             key, exc_info=True,
         )
         return None
+    _relabel_end_reason(gateway, old_sid, reason)
     new_sid = getattr(new_entry, "session_id", "?") if new_entry is not None else "?"
     logger.info(
         "session-reset-policy: reset %s (reason=%s, new session %s)",
         key, reason, new_sid,
     )
     return None  # always allow normal dispatch; the fresh session picks the message up
+
+
+def _relabel_end_reason(gateway: Any, session_id: Optional[str], reason: str) -> None:
+    """Record the timed boundary ("idle"/"daily") instead of the funnel's "session_reset".
+
+    The gateway treats "session_reset" as a USER boundary (like /new) and terminally drops any
+    async delegation completion still bound for the old session. A policy reset is not the user
+    closing the conversation, so its in-flight results must still be delivered. "idle"/"daily"
+    are recognised reset reasons (history stays closed) that are not user boundaries.
+    """
+    if not session_id:
+        return
+    db = getattr(gateway, "_session_db", None)
+    db = getattr(db, "_db", db)
+    write = getattr(db, "_execute_write", None)
+    if not callable(write):
+        return
+    try:
+        write(lambda conn: conn.execute(
+            "UPDATE sessions SET end_reason = ? WHERE id = ? AND end_reason = 'session_reset'",
+            (reason, session_id)))
+    except Exception:
+        logger.debug("session-reset-policy: end_reason relabel failed for %s", session_id, exc_info=True)
 
 
 def register(ctx: Any) -> None:

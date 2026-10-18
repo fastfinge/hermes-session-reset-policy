@@ -820,3 +820,24 @@ def test_new_past_boundary_rotates_once_with_real_funnel(plugin, tmp_path, hook_
     assert [name for name, _ in gw.hooks.emitted] == ["session:end", "session:reset"]
     assert calls.finalize and calls.finalize[0]["session_id"] == "seed-sid"
     assert store.lookup_by_session_key(key).session_id != "seed-sid"
+
+
+def test_relabel_end_reason_keeps_policy_reset_out_of_user_boundaries(plugin, tmp_path):
+    """A policy reset rotates through the /new funnel, which records ``session_reset`` — a user
+    boundary that terminally drops in-flight async completions for the old session. The plugin
+    relabels it to its own timed reason, and leaves any other end reason alone."""
+    hermes_state = _import_tree_module("hermes_state")
+    db = hermes_state.SessionDB(tmp_path / "state.db")
+    db.create_session("s-reset", "discord")
+    db.end_session("s-reset", "session_reset")
+    db.create_session("s-exit", "discord")
+    db.end_session("s-exit", "user_exit")
+    gateway = SimpleNamespace(_session_db=hermes_state.AsyncSessionDB(db))
+
+    plugin._relabel_end_reason(gateway, "s-reset", "idle")
+    plugin._relabel_end_reason(gateway, "s-exit", "idle")
+    plugin._relabel_end_reason(gateway, None, "idle")
+    plugin._relabel_end_reason(SimpleNamespace(), "s-reset", "daily")  # no DB: no-op
+
+    assert db.get_session("s-reset")["end_reason"] == "idle"
+    assert db.get_session("s-exit")["end_reason"] == "user_exit"
