@@ -41,9 +41,13 @@ dispatch, the plugin:
    plugin degrades to a bare ``SessionStore.reset_session()`` plus the
    lifecycle hook pair and the delegation interrupt — a consistent rotation,
    without the gateway-side cache/scope teardown.
-5. Otherwise records this message's arrival time as the new clock value
-   (via ``set_session_metadata``, which deliberately does not touch
-   ``updated_at``).
+5. Otherwise — and also right after a confirmed successful rotation (including
+   a reset funnel that threw after having already rotated) — records this
+   message's arrival time as the new clock value (via ``set_session_metadata``,
+   which deliberately does not touch ``updated_at``). The post-reset stamp
+   matters when the reset funnel preserves entry metadata: the replacement
+   entry would otherwise carry the OLD clock across the boundary, and the next
+   message would re-cross it and rotate a second time (issue #14).
 
 The event handed to the reset funnel is stripped of its text: the funnel
 treats ``event.get_command_args()`` as ``/new <title>``, and on a plain
@@ -109,7 +113,7 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.3.0"
+__version__ = "0.3.1"
 
 _META_KEY = "srp_last_user_inbound"
 
@@ -416,10 +420,24 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         )
         return None
     _relabel_end_reason(gateway, old_sid, reason)
-    new_sid = getattr(new_entry, "session_id", "?") if new_entry is not None else "?"
+    new_sid = getattr(new_entry, "session_id", None) if new_entry is not None else None
+    if new_entry is not None and new_sid != old_sid:
+        # Confirmed rotation (including a funnel that threw after having
+        # already rotated): this message IS the user activity of the fresh
+        # entry — advance the plugin clock NOW (#14). The stock funnel's
+        # replacement entry starts with empty metadata and the
+        # updated_at/created_at fallback covers it, but a metadata-preserving
+        # reset carries the OLD clock onto the replacement entry; without this
+        # stamp the next message re-crosses the same daily boundary and
+        # rotates a second time. Only ``srp_last_user_inbound`` is written:
+        # unrelated carryover metadata is left alone.
+        try:
+            session_store.set_session_metadata(key, _META_KEY, now.isoformat())
+        except Exception:
+            logger.debug("session_reset clock stamp failed", exc_info=True)
     logger.info(
         "session-reset-policy: reset %s (reason=%s, new session %s)",
-        key, reason, new_sid,
+        key, reason, new_sid or "?",
     )
     return None  # always allow normal dispatch; the fresh session picks the message up
 

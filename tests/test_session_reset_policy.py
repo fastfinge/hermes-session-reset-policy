@@ -822,6 +822,91 @@ def test_new_past_boundary_rotates_once_with_real_funnel(plugin, tmp_path, hook_
     assert store.lookup_by_session_key(key).session_id != "seed-sid"
 
 
+# ---------------------------------------------------------------------------
+# Issue #14: a metadata-preserving reset funnel carries the plugin's clock
+# onto the replacement entry. The successful reset branch must advance the
+# clock on that replacement entry, or the NEXT message re-crosses the same
+# boundary and the route rotates a second time.
+# ---------------------------------------------------------------------------
+
+def _freeze_plugin_now(plugin, monkeypatch, at: datetime):
+    """Freeze the plugin's ``datetime.now()`` (kept deterministic around the
+    daily boundary), leaving fromisoformat parsing behaviour intact."""
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls.fromisoformat(at.isoformat())
+    monkeypatch.setattr(plugin, "datetime", _Frozen)
+
+def _metadata_preserving_funnel(store, key, calls, *, explode_after=False):
+    """The reporter's owner/carryover reset funnel: rotate the route through the
+    store, then carry EVERY metadata entry (unrelated pending-work state AND the
+    plugin's own clock) onto the replacement entry."""
+    async def funnel(evt):
+        old = store.lookup_by_session_key(key)
+        carried = dict(getattr(old, "metadata", None) or {})
+        new_sid = store.reset_session(key).session_id
+        for meta_key, meta_val in carried.items():
+            store.set_session_metadata(key, meta_key, meta_val)
+        calls.append((new_sid, carried))
+        if explode_after:
+            raise RuntimeError("banner exploded after the rotation")
+    return funnel
+
+def _two_messages_past_daily_boundary(plugin, store, gateway, tmp_path, monkeypatch, *, explode_after):
+    """One seeded route, clock at 03:00 behind a 04:00 daily boundary, two
+    ordinary inbound messages at 08:00. Returns the metadata-preserving funnel
+    calls and the session id after the first message."""
+    key, entry = _seed_route(store, updated_minutes_ago=30)
+    store.set_session_metadata(key, "srp_last_user_inbound",
+                               datetime(2026, 9, 26, 3, 0).isoformat())
+    store.set_session_metadata(key, "pending_work", {"queue": "review", "id": 7})
+    calls = []
+    funnel = _metadata_preserving_funnel(store, key, calls, explode_after=explode_after)
+    gateway._handle_reset_command = funnel
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    policy = {"mode": "daily", "at_hour": 4}
+    _freeze_plugin_now(plugin, monkeypatch, datetime(2026, 9, 26, 8, 0))
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gateway, store)) is None  # first message
+        first_sid = store.lookup_by_session_key(key).session_id
+        assert first_sid != "seed-sid"  # the first message rotated exactly once
+        assert _run(plugin._maybe_reset(event, gateway, store)) is None  # second message
+    return calls, first_sid
+
+def test_issue14_daily_reset_rotates_once_across_two_messages(plugin, tmp_path, monkeypatch):
+    """Two ordinary inbound messages after one daily boundary must rotate the
+    route exactly once even when the reset funnel carries the plugin clock onto
+    the replacement entry (#14)."""
+    store = _make_real_store(tmp_path)
+    key = "agent:main:telegram:dm:test-chat"
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    calls, first_sid = _two_messages_past_daily_boundary(
+        plugin, store, gateway, tmp_path, monkeypatch, explode_after=False)
+
+    assert store.lookup_by_session_key(key).session_id == first_sid  # no second rotation
+    assert len(calls) == 1
+    # The successful reset stamped the fresh entry's clock at the inbound time.
+    stamp = store.get_session_metadata(key, "srp_last_user_inbound")
+    assert datetime.fromisoformat(stamp) >= datetime(2026, 9, 26, 8, 0)
+    # Unrelated carryover metadata survives, untouched.
+    assert store.get_session_metadata(key, "pending_work") == {"queue": "review", "id": 7}
+
+def test_issue14_clock_stamped_when_funnel_throws_after_rotating(plugin, tmp_path, monkeypatch):
+    """Same, through the funnel-throws-after-rotating path (#14): the rotation
+    is kept, so it must also clear the pending boundary or the next message
+    rotates a second time."""
+    store = _make_real_store(tmp_path)
+    key = "agent:main:telegram:dm:test-chat"
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    calls, first_sid = _two_messages_past_daily_boundary(
+        plugin, store, gateway, tmp_path, monkeypatch, explode_after=True)
+
+    assert store.lookup_by_session_key(key).session_id == first_sid  # no second rotation
+    assert len(calls) == 1
+    assert store.get_session_metadata(key, "pending_work") == {"queue": "review", "id": 7}
+
+
 def test_relabel_end_reason_keeps_policy_reset_out_of_user_boundaries(plugin, tmp_path):
     """A policy reset rotates through the /new funnel, which records ``session_reset`` — a user
     boundary that terminally drops in-flight async completions for the old session. The plugin

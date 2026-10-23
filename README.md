@@ -30,7 +30,10 @@ message, before auth and dispatch, it:
    `profiles/<name>` dir — see issue #4).
 3. Compares the routing entry's user-activity clock — the plugin's own
    `srp_last_user_inbound` session metadata, advanced only by messages that
-   reach this hook (slash commands and internal/cron traffic never do) —
+   reach this hook (slash commands and internal/cron traffic never do;
+   the clock is also stamped onto the replacement entry right after a policy
+   reset, so a metadata-preserving reset funnel cannot carry the stale clock
+   across the boundary and trigger a second rotation — issue #14) —
    against the idle threshold and/or the daily boundary. Entries that predate
    the plugin fall back to `updated_at`/`created_at` once, then the metadata
    clock takes over.
