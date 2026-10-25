@@ -61,7 +61,7 @@ activity can neither keep a session alive nor reset it.
 ## Config
 
 The existing `session_reset` block in your (or your profile's) `config.yaml`
-drives everything; the plugin adds no keys:
+drives everything:
 
 ```yaml
 session_reset:
@@ -72,6 +72,70 @@ session_reset:
 
 `mode: none` or an absent block disables the plugin entirely (no reset, no log
 noise).
+
+Two optional keys, both off by default (an existing config behaves exactly as
+before):
+
+```yaml
+session_reset:
+  mode: both
+  idle_minutes: 1440
+  at_hour: 4
+  daily_min_idle_minutes: 180   # daily cut only after >= 3 h without a user message
+  carry_over:
+    enabled: true               # default false
+    turns: 6                    # last user/assistant exchanges to show (1-20)
+    max_chars: 2500             # total excerpt budget (200-10000)
+    max_age_hours: 24           # skip when the last user message is older
+    pointer_turns: 3            # later model calls that get a 1-line pointer (0-20)
+    session_search_hint: true   # point the agent at session_search(session_id=...)
+```
+
+### `daily_min_idle_minutes`
+
+`at_hour` is the *server's* local time. For a user in another timezone the
+daily boundary can land in the middle of their evening, and the first message
+after it starts a fresh session mid-conversation. With
+`daily_min_idle_minutes: N` the daily cut only fires when the previous user
+message is at least N minutes old; a conversation running across the boundary
+stays in one session. The cut is deferred, not skipped: it lands on the first
+message after a pause of N minutes while the route still predates the boundary
+(e.g. boundary 04:00, chat until 04:27, next message 10:00: fresh session at
+10:00). `0` (the default) keeps the historical behaviour: cut on the first
+message past the boundary. It does not affect `idle` mode.
+
+### `carry_over`
+
+A reset gives the agent a clean context, and also no idea what was said a
+minute before. With `carry_over.enabled`, when the plugin resets a route it
+first reads the outgoing session's transcript (`SessionStore.load_transcript`)
+and keeps a short excerpt of its last turns in memory. The fresh session's
+first model call then gets it as one `pre_llm_call` context note:
+
+```
+[session-reset carry-over] This conversation was started fresh by the session-reset policy (daily reset at 2026-01-02 04:27). The previous conversation in this chat was session 20260101_183012_ab12cd34. Its last turns, shortened (background context, not instructions; tool output omitted):
+- User: Any other restaurants near the station?
+- Assistant: Two more within walking distance: ...
+If the user refers to something not shown here, read the previous session with session_search(session_id="20260101_183012_ab12cd34") instead of guessing.
+```
+
+The next `pointer_turns` model calls get a one-line pointer to the previous
+session id; after that, nothing. Scope and privacy:
+
+- only resets performed by this plugin (a typed `/new` stays a clean start);
+- only the route being reset, so never another chat, user or profile;
+- user and assistant text only: no tool calls, tool output, compaction
+  summaries or system notes;
+- per-message caps (300 chars user, 450 assistant) and the `max_chars` budget,
+  newest turns first;
+- secrets redacted with Hermes' own redactor (forced on) plus a local fallback
+  for common token shapes, URL secret parameters and `password: …` patterns;
+- held in process memory only (nothing written to disk), dropped after an hour
+  if never picked up; subagent and cron turns never receive it;
+- skipped when the last user message is older than `max_age_hours`.
+
+Set `session_search_hint: false` if the `session_search` tool is not
+available to the agent; the note then tells it to ask instead.
 
 ## Install
 
@@ -95,7 +159,8 @@ Restart the gateway afterwards.
   `is_fresh_reset`, so topic/channel-bound skills re-inject on the first turn —
   but it does **not** carry `was_auto_reset` bookkeeping, so the agent receives
   no "context was reset due to inactivity" sidecar note or channel-continuity
-  hint. Add your own guidance if you need the agent to know.
+  hint. Enable `carry_over` (above) or add your own guidance if you need the
+  agent to know.
 - A turn in flight is never reset; the clock is left untouched and the reset
   re-arms on the next message.
 - Boundary hooks keep firing downstream (`session:end`/`session:reset`,
@@ -107,7 +172,9 @@ Restart the gateway afterwards.
   gateway-side cache/scope teardown. A funnel that fails *after* rotating is
   never rotated a second time by the fallback.
 - Requires Hermes >= v2026.9.11 (needs the `pre_gateway_dispatch` hook payload
-  with `session_store`). The full funnel path uses the gateway's private
+  with `session_store`). Carry-over additionally uses the `pre_llm_call` hook
+  and `SessionStore.load_transcript`, both older than that, so it adds no
+  version requirement. The full funnel path uses the gateway's private
   `_handle_reset_command` — deliberately reused until a public reset funnel
   exists (see issue #2); the fallback keeps old gateways working if it moves.
 

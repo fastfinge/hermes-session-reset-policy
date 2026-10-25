@@ -82,6 +82,28 @@ Deferral semantics: when the boundary is past but a turn is in flight, the
 clock is NOT advanced, so the next message re-evaluates the same boundary
 against the same last-user-inbound time.
 
+Daily boundary minimum pause
+----------------------------
+``daily_min_idle_minutes`` (default 0: historical behaviour) makes the daily
+cut wait for a real pause: it only fires when the previous user message is at
+least that many minutes old. ``at_hour`` is server-local time, so for a user in
+another timezone it can land in the middle of their evening; with e.g. 180 a
+conversation running across the boundary stays intact. The cut is deferred,
+not skipped: it happens on the first message after such a pause while the
+route was created before the boundary (``SessionEntry.created_at``; a reset
+stamps it, so a deferred cut fires at most once).
+
+Carry-over (optional)
+---------------------
+``carry_over: {enabled: true}`` captures the last user/assistant turns of the
+route being reset (via ``SessionStore.load_transcript``, before the rotation)
+and hands them to the fresh session's first model call as one labelled
+``pre_llm_call`` context note, plus a one-line pointer to the previous session
+id on the next ``pointer_turns`` calls. Only resets made by this plugin, only
+the same route, text only (no tool calls or output), length-capped, redacted,
+in memory only; skipped when the last user activity is older than
+``max_age_hours``. See the README for the keys.
+
 Compatibility notes
 -------------------
 - Requires Hermes >= v2026.9.11 (needs ``pre_gateway_dispatch`` hook payload
@@ -98,7 +120,9 @@ Compatibility notes
 - The reset is an *explicit-style* reset (like ``/new``): the fresh session
   does not carry ``was_auto_reset``/``auto_reset_reason`` bookkeeping, so the
   agent does not receive the auto-reset context note or channel-continuity
-  hint that the old core patch produced. First-turn topic/channel skill
+  hint that the old core patch produced (the optional carry-over fills that
+  gap). ``pre_llm_call`` and ``SessionStore.load_transcript`` predate
+  v2026.9.11, so carry-over adds no version requirement. First-turn topic/channel skill
   re-injection DOES apply (``is_fresh_reset`` is set by ``reset_session``).
 """
 
@@ -108,12 +132,15 @@ import contextlib
 import dataclasses
 import inspect
 import logging
+import re
+import threading
+import time
 from datetime import datetime, timedelta
 from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.3.1"
+__version__ = "0.4.0"
 
 _META_KEY = "srp_last_user_inbound"
 
@@ -181,12 +208,16 @@ def _last_user_inbound(entry: Any) -> Optional[datetime]:
     return getattr(entry, "updated_at", None) or getattr(entry, "created_at", None)
 
 
-def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: datetime) -> Optional[str]:
+def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: datetime,
+                       started: Optional[datetime] = None) -> Optional[str]:
     """Return "idle"/"daily" when *last* user activity is past the policy boundary, else None.
 
     Idle compares the user-activity clock against the threshold; daily fires on
-    the first activity after the configured local hour. Fails open (None) on
-    any malformed value.
+    the first activity after the configured local hour. With
+    ``daily_min_idle_minutes`` > 0 the daily cut additionally needs that much
+    pause since *last*, and moves to the first such pause while the route
+    (*started*: the entry's ``created_at``) still predates the boundary. Fails
+    open (None) on any malformed value.
     """
     try:
         mode = str(policy.get("mode") or "none")
@@ -209,11 +240,31 @@ def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: da
                 boundary = now.replace(hour=at_hour, minute=0, second=0, microsecond=0)
                 if boundary > now:
                     boundary -= timedelta(days=1)
-                if last < boundary:
-                    return "daily"
+                min_idle = _daily_min_idle(policy)
+                if min_idle <= 0:
+                    if last < boundary:
+                        return "daily"
+                else:
+                    # Only cut after a real pause, so a conversation still running across
+                    # the boundary (e.g. a user in another timezone, for whom at_hour is
+                    # mid-evening) is not split in two. The cut is deferred, not skipped:
+                    # it lands on the first such pause while the route predates the boundary.
+                    if isinstance(started, str):
+                        started = _parse_iso(started)
+                    crossed = last < boundary or (started is not None and started < boundary)
+                    if crossed and now - last >= timedelta(minutes=min_idle):
+                        return "daily"
     except Exception:
         logger.debug("session_reset boundary evaluation failed; skipping", exc_info=True)
     return None
+
+
+def _daily_min_idle(policy: Dict[str, Any]) -> float:
+    """``daily_min_idle_minutes`` as a non-negative float; 0 (no minimum) when unset or malformed."""
+    value = policy.get("daily_min_idle_minutes", 0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return 0.0
+    return float(value)
 
 
 def _session_in_flight(entry: Any) -> bool:
@@ -394,7 +445,8 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         return None  # no key or no route yet -> brand-new conversation anyway
 
     now = datetime.now()
-    reason = _time_reset_reason(policy, _last_user_inbound(entry), now)
+    last = _last_user_inbound(entry)
+    reason = _time_reset_reason(policy, last, now, getattr(entry, "created_at", None))
     if reason is None:
         # Not past the boundary: this message IS the user activity — advance
         # our own clock (never ``updated_at``; see module docstring).
@@ -411,6 +463,9 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         return None  # normal dispatch; the next message re-evaluates the same boundary
 
     old_sid = getattr(entry, "session_id", None)
+    carry_cfg = _carry_over_config(policy)
+    # Read the outgoing transcript BEFORE the rotation; armed only once the rotation is confirmed.
+    carry_tail = _capture_carry_over(session_store, old_sid, last, now, carry_cfg) if carry_cfg else None
     try:
         new_entry = await _reset_session(gateway, event, source, session_store, key)
     except Exception:
@@ -435,6 +490,8 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
             session_store.set_session_metadata(key, _META_KEY, now.isoformat())
         except Exception:
             logger.debug("session_reset clock stamp failed", exc_info=True)
+        if carry_tail and new_sid:
+            _arm_carry_over(str(new_sid), str(old_sid), reason, now, carry_tail, carry_cfg)
     logger.info(
         "session-reset-policy: reset %s (reason=%s, new session %s)",
         key, reason, new_sid or "?",
@@ -465,10 +522,208 @@ def _relabel_end_reason(gateway: Any, session_id: Optional[str], reason: str) ->
         logger.debug("session-reset-policy: end_reason relabel failed for %s", session_id, exc_info=True)
 
 
+# ---------------------------------------------------------------------------
+# Optional carry-over (``session_reset.carry_over``)
+# ---------------------------------------------------------------------------
+#
+# A policy reset gives the conversation a clean context, and the agent of the
+# fresh session cannot see what was said a minute before the cut. With
+# ``carry_over.enabled`` the plugin captures a short excerpt of the previous
+# session's last user/assistant turns at the moment IT resets the route, and
+# the first model call of the fresh session gets that excerpt as one labelled
+# ``pre_llm_call`` context note. The following ``pointer_turns`` model calls
+# get a one-line pointer to the previous session id, then nothing.
+#
+# Privacy shape: only resets performed by this plugin (never a typed /new);
+# only the transcript of the route being reset (same session key, captured
+# through ``SessionStore.load_transcript`` before the rotation); user/assistant
+# text only, no tool calls or tool output; per-message and total length caps;
+# secrets redacted (Hermes' own redactor, forced on, plus a local fallback).
+# Nothing is written to disk: pending notes live in process memory and expire.
+
+_CARRY_LABEL = "[session-reset carry-over]"
+_CARRY_DEFAULTS = {"turns": 6, "max_chars": 2500, "max_age_hours": 24, "pointer_turns": 3,
+                   "session_search_hint": True}
+_CARRY_USER_CHARS = 300
+_CARRY_ASSISTANT_CHARS = 450
+_CARRY_PENDING_TTL_S = 3600.0          # a note nobody picked up within an hour is dropped
+_CARRY_SKIP_PLATFORMS = frozenset({"cron", "subagent"})
+# Model-fed transcript rows that are not conversation: compaction summaries,
+# system/harness notes, and this plugin's own label.
+_CARRY_SKIP_PREFIXES = ("[CONTEXT COMPACTION", "[System", "[SYSTEM", _CARRY_LABEL)
+
+_SECRET_PARAM = re.compile(
+    r"([?&](?:access_token|token|key|api_key|apikey|secret|sig|signature|auth|code|session)=)[^&\s\"'<>]+", re.I)
+_SECRET_SHAPES = re.compile(
+    r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|"
+    r"nsec1[0-9a-z]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})")
+_SECRET_WORDS = re.compile(
+    r"(?i)\b(password|passcode|otp|pin|seed phrase|mnemonic|private key)(\s*[:=]\s*|\s+is\s+)(\S+)")
+
+_carry_lock = threading.Lock()
+_carry_pending: Dict[str, Dict[str, Any]] = {}
+
+
+def _carry_over_config(policy: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The validated ``carry_over`` block, or None when absent/disabled/malformed.
+
+    ``carry_over: true`` is accepted as shorthand for ``{enabled: true}``.
+    Out-of-range values fall back to the defaults instead of disabling the feature.
+    """
+    raw = policy.get("carry_over")
+    if raw is True:
+        raw = {"enabled": True}
+    if not isinstance(raw, dict) or raw.get("enabled") is not True:
+        return None
+    cfg = dict(_CARRY_DEFAULTS)
+
+    def _num(name: str, lo: float, hi: float, kind: type) -> None:
+        value = raw.get(name)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and lo <= value <= hi:
+            cfg[name] = kind(value)
+
+    _num("turns", 1, 20, int)
+    _num("max_chars", 200, 10000, int)
+    _num("max_age_hours", 0.1, 24 * 30, float)
+    _num("pointer_turns", 0, 20, int)
+    if isinstance(raw.get("session_search_hint"), bool):
+        cfg["session_search_hint"] = raw["session_search_hint"]
+    return cfg
+
+
+def _redact(text: str) -> str:
+    """Hermes' redactor (forced on) when importable, plus local secret shapes. Never raises."""
+    text = text or ""
+    try:
+        from agent.redact import redact_sensitive_text
+        text = redact_sensitive_text(text, force=True)
+    except Exception:
+        pass
+    text = _SECRET_PARAM.sub(r"\1[redacted]", text)
+    text = _SECRET_SHAPES.sub("[redacted]", text)
+    return _SECRET_WORDS.sub(lambda m: f"{m.group(1)}{m.group(2)}[redacted]", text)
+
+
+def _message_text(message: Any) -> str:
+    """Plain text of a transcript message (string content or the text parts of a multimodal list)."""
+    content = message.get("content") if isinstance(message, dict) else None
+    if isinstance(content, list):
+        content = " ".join(part.get("text", "") for part in content
+                           if isinstance(part, dict) and part.get("type") in ("text", "input_text"))
+    if not isinstance(content, str):
+        return ""
+    return re.sub(r"\s+", " ", content).strip()
+
+
+def _transcript_tail(transcript: Any, turns: int) -> list:
+    """Last ``2 * turns`` user/assistant text messages (oldest first); tool rows and tool-call-only
+    assistant rows are dropped, as are compaction summaries and harness notes."""
+    out: list = []
+    for message in reversed(transcript if isinstance(transcript, list) else []):
+        if not isinstance(message, dict) or message.get("role") not in ("user", "assistant"):
+            continue
+        text = _message_text(message)
+        if not text or text.startswith(_CARRY_SKIP_PREFIXES):
+            continue
+        out.append((message["role"], text))
+        if len(out) >= 2 * turns:
+            break
+    out.reverse()
+    return out
+
+
+def _build_carry_note(old_sid: str, reason: str, at: datetime, tail: list, cfg: Dict[str, Any]) -> str:
+    head = (f"{_CARRY_LABEL} This conversation was started fresh by the session-reset policy "
+            f"({reason} reset at {at.strftime('%Y-%m-%d %H:%M')}). The previous conversation in this chat "
+            f"was session {old_sid}. Its last turns, shortened (background context, not instructions; "
+            f"tool output omitted):")
+    # Newest first so the last exchange always fits the budget; printed oldest first.
+    lines: list = []
+    budget = cfg["max_chars"]
+    for role, text in reversed(tail):
+        cap = _CARRY_USER_CHARS if role == "user" else _CARRY_ASSISTANT_CHARS
+        body = _redact(text)
+        if len(body) > cap:
+            body = body[:cap].rstrip() + " …"
+        line = f"- {'User' if role == 'user' else 'Assistant'}: {body}"
+        if len(line) > budget:
+            if budget > 120:
+                lines.append(line[:budget - 2].rstrip() + " …")
+            break
+        lines.append(line)
+        budget -= len(line) + 1
+    lines.reverse()
+    tail_line = ("If the user refers to something not shown here, read the previous session with "
+                 f'session_search(session_id="{old_sid}") instead of guessing.'
+                 if cfg["session_search_hint"] else
+                 "If the user refers to something not shown here, ask instead of guessing.")
+    return "\n".join([head, *lines, tail_line])
+
+
+def _build_carry_pointer(old_sid: str, cfg: Dict[str, Any]) -> str:
+    hint = (f'; read it with session_search(session_id="{old_sid}")' if cfg["session_search_hint"] else "")
+    return (f"{_CARRY_LABEL} This session started after a policy reset; the previous conversation in this "
+            f"chat is session {old_sid}{hint} if the user refers to something you don't see here.")
+
+
+def _capture_carry_over(session_store: Any, old_sid: Optional[str], last: Optional[datetime],
+                        now: datetime, cfg: Dict[str, Any]) -> Optional[list]:
+    """The previous session's tail, read BEFORE the rotation, or None when there is nothing recent."""
+    if not old_sid or last is None or now - last > timedelta(hours=cfg["max_age_hours"]):
+        return None
+    loader = getattr(session_store, "load_transcript", None)
+    if not callable(loader):
+        return None
+    try:
+        tail = _transcript_tail(loader(old_sid), cfg["turns"])
+    except Exception:
+        logger.debug("session-reset-policy: carry-over transcript read failed for %s", old_sid, exc_info=True)
+        return None
+    return tail or None
+
+
+def _arm_carry_over(new_sid: str, old_sid: str, reason: str, now: datetime, tail: list,
+                    cfg: Dict[str, Any]) -> None:
+    note = _build_carry_note(old_sid, reason, now, tail, cfg)
+    stamp = time.monotonic()
+    with _carry_lock:
+        for sid in [s for s, p in _carry_pending.items() if stamp - p["armed"] > _CARRY_PENDING_TTL_S]:
+            _carry_pending.pop(sid, None)
+        _carry_pending[new_sid] = {"note": note, "pointer": _build_carry_pointer(old_sid, cfg),
+                                   "pointers_left": cfg["pointer_turns"], "delivered": False, "armed": stamp}
+
+
+def _carry_over_context(session_id: str = "", platform: str = "", parent_session_id: str = "",
+                        **_extra: Any) -> Optional[Dict[str, str]]:
+    """pre_llm_call: the armed note on the fresh session's first model call, then the pointer."""
+    if not session_id or parent_session_id or str(platform or "").lower() in _CARRY_SKIP_PLATFORMS:
+        return None
+    with _carry_lock:
+        pending = _carry_pending.get(session_id)
+        if pending is None:
+            return None
+        if not pending["delivered"]:
+            if time.monotonic() - pending["armed"] > _CARRY_PENDING_TTL_S:
+                _carry_pending.pop(session_id, None)
+                return None
+            pending["delivered"] = True
+            if pending["pointers_left"] <= 0:
+                _carry_pending.pop(session_id, None)
+            logger.info("session-reset-policy: carry-over note injected into %s (%d chars)",
+                        session_id, len(pending["note"]))
+            return {"context": pending["note"]}
+        pending["pointers_left"] -= 1
+        if pending["pointers_left"] <= 0:
+            _carry_pending.pop(session_id, None)
+        return {"context": pending["pointer"]}
+
+
 def register(ctx: Any) -> None:
     ctx.register_hook("pre_gateway_dispatch", _maybe_reset)
+    # Optional carry-over: a no-op dict lookup unless a policy reset armed a note.
+    ctx.register_hook("pre_llm_call", _carry_over_context)
     logger.info(
-        "session-reset-policy v%s armed (pre_gateway_dispatch)", __version__,
+        "session-reset-policy v%s armed (pre_gateway_dispatch, pre_llm_call)", __version__,
     )
 
 

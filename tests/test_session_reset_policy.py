@@ -179,6 +179,47 @@ def test_daily_mode_boundary_in_future_rolls_back_a_day(plugin):
     # last=day-before-yesterday -> reset
     assert plugin._time_reset_reason(policy, datetime(2026, 9, 24, 12, 0), now) == "daily"
 
+def test_daily_min_idle_default_keeps_historical_cut(plugin):
+    # No daily_min_idle_minutes: the first message past the boundary cuts, even 1 minute after the last one.
+    now = datetime(2026, 9, 26, 4, 1)
+    assert plugin._time_reset_reason({"mode": "daily", "at_hour": 4}, datetime(2026, 9, 26, 3, 59), now) == "daily"
+
+def test_daily_min_idle_keeps_conversation_across_boundary(plugin):
+    # A conversation still running at the boundary (03:59 -> 04:27) is not cut...
+    now = datetime(2026, 9, 26, 4, 27)
+    policy = {"mode": "daily", "at_hour": 4, "daily_min_idle_minutes": 180}
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 3, 59), now) is None
+    # ...but a real pause before the boundary still is.
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 0, 30), now) == "daily"
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 1, 27), now) == "daily"  # exactly 180 min
+
+def test_daily_min_idle_defers_cut_to_first_real_pause(plugin):
+    # Chat ran across 04:00 (route created the evening before, last message 04:27): the cut is deferred
+    # to the first message after a >= 180 min pause, not skipped for the day.
+    policy = {"mode": "daily", "at_hour": 4, "daily_min_idle_minutes": 180}
+    started, last = datetime(2026, 9, 25, 22, 0), datetime(2026, 9, 26, 4, 27)
+    assert plugin._time_reset_reason(policy, last, datetime(2026, 9, 26, 5, 0), started) is None
+    assert plugin._time_reset_reason(policy, last, datetime(2026, 9, 26, 10, 0), started) == "daily"
+    # A route created after the boundary (e.g. by that cut) is not cut again the same day.
+    fresh = datetime(2026, 9, 26, 10, 0)
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 10, 5), datetime(2026, 9, 26, 15, 0), fresh) is None
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 10, 5), datetime(2026, 9, 27, 9, 0), fresh) == "daily"
+
+def test_daily_without_min_idle_ignores_route_start(plugin):
+    # Default (0): unchanged historical semantics, the route's created_at plays no role.
+    policy = {"mode": "daily", "at_hour": 4}
+    started = datetime(2026, 9, 25, 22, 0)
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 4, 27), datetime(2026, 9, 26, 10, 0), started) is None
+
+@pytest.mark.parametrize("bad", [-5, "180", None, True, [180]])
+def test_daily_min_idle_malformed_means_no_minimum(plugin, bad):
+    policy = {"mode": "daily", "at_hour": 4, "daily_min_idle_minutes": bad}
+    assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 3, 59), datetime(2026, 9, 26, 4, 1)) == "daily"
+
+def test_daily_min_idle_does_not_touch_idle_mode(plugin):
+    policy = {"mode": "both", "idle_minutes": 30, "at_hour": 4, "daily_min_idle_minutes": 180}
+    assert plugin._time_reset_reason(policy, _last(45), NOW) == "idle"
+
 def test_both_mode_idle_wins_first(plugin):
     policy = {"mode": "both", "idle_minutes": 30, "at_hour": 4}
     assert plugin._time_reset_reason(policy, _last(90), NOW) == "idle"
@@ -213,7 +254,10 @@ def test_created_at_fallback(plugin):
 def test_register_registers_hook(plugin):
     ctx = mock.MagicMock()
     plugin.register(ctx)
-    ctx.register_hook.assert_called_once_with("pre_gateway_dispatch", plugin._maybe_reset)
+    assert ctx.register_hook.call_args_list == [
+        mock.call("pre_gateway_dispatch", plugin._maybe_reset),
+        mock.call("pre_llm_call", plugin._carry_over_context),
+    ]
 
 
 # ---------------------------------------------------------------------------
@@ -926,3 +970,221 @@ def test_relabel_end_reason_keeps_policy_reset_out_of_user_boundaries(plugin, tm
 
     assert db.get_session("s-reset")["end_reason"] == "idle"
     assert db.get_session("s-exit")["end_reason"] == "user_exit"
+
+
+# ---------------------------------------------------------------------------
+# carry_over — optional excerpt of the previous conversation after a policy
+# reset (config parsing, transcript filtering, note shape, pre_llm_call
+# delivery, and the end-to-end arm-on-reset path against the real store)
+# ---------------------------------------------------------------------------
+
+def _carry_policy(**carry):
+    return {"mode": "idle", "idle_minutes": 60, "carry_over": dict({"enabled": True}, **carry)}
+
+def _carry_cfg(plugin, **carry):
+    return plugin._carry_over_config(_carry_policy(**carry))
+
+_TRANSCRIPT = [
+    {"role": "system", "content": "system prompt"},
+    {"role": "user", "content": "[CONTEXT COMPACTION] earlier turns summarised"},
+    {"role": "user", "content": "Any other restaurants near the station?"},
+    {"role": "assistant", "content": None,
+     "tool_calls": [{"id": "c1", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}]},
+    {"role": "tool", "tool_call_id": "c1", "content": "TOOL OUTPUT must never be carried"},
+    {"role": "assistant", "content": "Two more within walking distance: Alpha and Beta."},
+    {"role": "user", "content": [{"type": "text", "text": "Which one is"}, {"type": "image_url", "image_url": {}},
+                                 {"type": "text", "text": "open late?"}]},
+    {"role": "assistant", "content": "Beta, until 23:00. My password: hunter2 is not something to share."},
+]
+
+def test_maybe_reset_daily_min_idle_deferred_cut_end_to_end(plugin, tmp_path, monkeypatch):
+    """Real store: a route created before 04:00 whose clock was advanced at 04:27 (cut deferred) rotates
+    on the first message after a 180-minute pause, and the replacement route is not cut again."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store)
+    entry.created_at = datetime(2026, 9, 25, 22, 0)
+    store.set_session_metadata(key, "srp_last_user_inbound", datetime(2026, 9, 26, 4, 27).isoformat())
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    policy = {"mode": "daily", "at_hour": 4, "daily_min_idle_minutes": 180}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        _freeze_plugin_now(plugin, monkeypatch, datetime(2026, 9, 26, 10, 0))
+        _run(plugin._maybe_reset(event, gateway, store))
+        first = store.lookup_by_session_key(key).session_id
+        assert first != "seed-sid"
+        _freeze_plugin_now(plugin, monkeypatch, datetime(2026, 9, 26, 14, 0))
+        _run(plugin._maybe_reset(event, gateway, store))
+        assert store.lookup_by_session_key(key).session_id == first
+
+def test_carry_over_config_off_by_default(plugin):
+    assert plugin._carry_over_config({"mode": "idle"}) is None
+    assert plugin._carry_over_config({"carry_over": {"turns": 6}}) is None  # enabled must be true
+    assert plugin._carry_over_config({"carry_over": "yes"}) is None
+    assert plugin._carry_over_config({"carry_over": {"enabled": "true"}}) is None
+
+def test_carry_over_config_defaults_and_shorthand(plugin):
+    cfg = plugin._carry_over_config({"carry_over": True})
+    assert cfg == {"turns": 6, "max_chars": 2500, "max_age_hours": 24.0, "pointer_turns": 3,
+                   "session_search_hint": True}
+    cfg = _carry_cfg(plugin, turns=2, max_chars=800, max_age_hours=6, pointer_turns=0, session_search_hint=False)
+    assert cfg == {"turns": 2, "max_chars": 800, "max_age_hours": 6.0, "pointer_turns": 0,
+                   "session_search_hint": False}
+
+def test_carry_over_config_out_of_range_falls_back(plugin):
+    cfg = _carry_cfg(plugin, turns=0, max_chars=50, max_age_hours=-1, pointer_turns=True)
+    assert (cfg["turns"], cfg["max_chars"], cfg["max_age_hours"], cfg["pointer_turns"]) == (6, 2500, 24, 3)
+
+def test_transcript_tail_is_text_only(plugin):
+    tail = plugin._transcript_tail(_TRANSCRIPT, turns=6)
+    assert tail == [
+        ("user", "Any other restaurants near the station?"),
+        ("assistant", "Two more within walking distance: Alpha and Beta."),
+        ("user", "Which one is open late?"),
+        ("assistant", "Beta, until 23:00. My password: hunter2 is not something to share."),
+    ]
+    assert plugin._transcript_tail(_TRANSCRIPT, turns=1) == tail[-2:]
+    assert plugin._transcript_tail(None, turns=3) == []
+
+def test_carry_note_shape_and_redaction(plugin):
+    cfg = _carry_cfg(plugin)
+    tail = plugin._transcript_tail(_TRANSCRIPT, turns=6)
+    note = plugin._build_carry_note("old-sid", "daily", datetime(2026, 9, 26, 4, 27), tail, cfg)
+    assert note.startswith("[session-reset carry-over]")
+    assert "daily reset at 2026-09-26 04:27" in note and "session old-sid" in note
+    assert "- User: Any other restaurants near the station?" in note
+    assert "- Assistant: Beta, until 23:00." in note
+    assert "hunter2" not in note and "[redacted]" in note
+    assert "TOOL OUTPUT" not in note and "COMPACTION" not in note
+    assert note.rstrip().endswith('session_search(session_id="old-sid") instead of guessing.')
+    no_hint = plugin._build_carry_note("old-sid", "daily", datetime(2026, 9, 26, 4, 27), tail,
+                                       _carry_cfg(plugin, session_search_hint=False))
+    assert "session_search" not in no_hint and "ask instead of guessing" in no_hint
+
+def test_carry_note_respects_caps_newest_first(plugin):
+    cfg = _carry_cfg(plugin, max_chars=600)
+    tail = [("user", "u" * 1000), ("assistant", "a" * 1000), ("user", "LAST " + "z" * 1000)]
+    note = plugin._build_carry_note("old-sid", "idle", datetime(2026, 9, 26, 9, 0), tail, cfg)
+    lines = [ln for ln in note.splitlines() if ln.startswith("- ")]
+    assert lines[-1].startswith("- User: LAST ")  # the newest turn always makes it in
+    assert all(len(ln) <= len("- Assistant: ") + plugin._CARRY_ASSISTANT_CHARS + 2 for ln in lines)
+    assert sum(len(ln) + 1 for ln in lines) <= 600 + 1
+    assert not any(ln.startswith("- User: uuu") for ln in lines)  # oldest dropped past the budget
+
+def test_carry_over_context_note_then_pointers_then_nothing(plugin):
+    cfg = _carry_cfg(plugin, pointer_turns=2)
+    plugin._arm_carry_over("new-sid", "old-sid", "daily", datetime(2026, 9, 26, 4, 27),
+                           [("user", "hello"), ("assistant", "hi")], cfg)
+    assert plugin._carry_over_context(session_id="other-sid", platform="telegram") is None
+    first = plugin._carry_over_context(session_id="new-sid", platform="telegram")
+    assert "- User: hello" in first["context"]
+    for _ in range(2):
+        ptr = plugin._carry_over_context(session_id="new-sid", platform="telegram")["context"]
+        assert "session old-sid" in ptr and "- User" not in ptr
+    assert plugin._carry_over_context(session_id="new-sid", platform="telegram") is None
+    assert plugin._carry_pending == {}
+
+def test_carry_over_context_skips_subagents_and_cron(plugin):
+    plugin._arm_carry_over("new-sid", "old-sid", "idle", datetime(2026, 9, 26, 9, 0), [("user", "x")],
+                           _carry_cfg(plugin, pointer_turns=0))
+    assert plugin._carry_over_context(session_id="new-sid", platform="cron") is None
+    assert plugin._carry_over_context(session_id="new-sid", platform="telegram",
+                                      parent_session_id="new-sid") is None  # delegated child turn
+    assert plugin._carry_over_context(session_id="new-sid", platform="telegram")["context"]
+    assert plugin._carry_over_context(session_id="new-sid", platform="telegram") is None  # pointer_turns=0
+
+def test_carry_over_note_expires_when_never_picked_up(plugin, monkeypatch):
+    plugin._arm_carry_over("new-sid", "old-sid", "idle", datetime(2026, 9, 26, 9, 0), [("user", "x")],
+                           _carry_cfg(plugin))
+    later = plugin.time.monotonic() + plugin._CARRY_PENDING_TTL_S + 1
+    monkeypatch.setattr(plugin.time, "monotonic", lambda: later)
+    assert plugin._carry_over_context(session_id="new-sid", platform="telegram") is None
+    assert "new-sid" not in plugin._carry_pending
+
+def _carry_store(tmp_path, *, updated_minutes_ago=120):
+    """Real store + route; the outgoing transcript comes through a recorder on
+    the store's public ``load_transcript`` (the plugin's only transcript API)."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=updated_minutes_ago)
+    reads = []
+
+    def load_transcript(sid):
+        reads.append((sid, store.lookup_by_session_key(key).session_id))
+        return list(_TRANSCRIPT)
+
+    store.load_transcript = load_transcript
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    return store, key, gateway, reads
+
+def test_carry_over_armed_by_policy_reset(plugin, tmp_path):
+    store, key, gateway, reads = _carry_store(tmp_path)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy()):
+        assert _run(plugin._maybe_reset(event, gateway, store)) is None
+    new_sid = store.lookup_by_session_key(key).session_id
+    assert new_sid != "seed-sid"
+    assert reads == [("seed-sid", "seed-sid")]  # the OUTGOING session, read before the rotation
+    note = plugin._carry_over_context(session_id=new_sid, platform="telegram")["context"]
+    assert "idle reset" in note and "session seed-sid" in note
+    assert "Beta, until 23:00." in note and "TOOL OUTPUT" not in note
+    assert "session seed-sid" in plugin._carry_over_context(session_id=new_sid, platform="telegram")["context"]
+
+def test_carry_over_disabled_reads_nothing(plugin, tmp_path):
+    store, key, gateway, reads = _carry_store(tmp_path)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    with mock.patch.object(plugin, "_read_session_reset_policy",
+                           return_value={"mode": "idle", "idle_minutes": 60}):
+        _run(plugin._maybe_reset(event, gateway, store))
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"  # reset still happens
+    assert reads == [] and plugin._carry_pending == {}
+
+def test_carry_over_skipped_when_previous_activity_too_old(plugin, tmp_path):
+    store, key, gateway, reads = _carry_store(tmp_path, updated_minutes_ago=30 * 60)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy(max_age_hours=24)):
+        _run(plugin._maybe_reset(event, gateway, store))
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"
+    assert reads == [] and plugin._carry_pending == {}
+
+def test_carry_over_not_armed_without_rotation(plugin, tmp_path):
+    """No confirmed rotation (deferral for an in-flight turn) -> nothing armed."""
+    store = _make_real_store(tmp_path)
+    key, entry = _seed_route(store, updated_minutes_ago=120, token="turn-1")
+    store.load_transcript = lambda sid: list(_TRANSCRIPT)
+    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy()):
+        _run(plugin._maybe_reset(event, gateway, store))
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert plugin._carry_pending == {}
+
+def test_carry_over_survives_transcript_read_failure(plugin, tmp_path):
+    store, key, gateway, reads = _carry_store(tmp_path)
+
+    def broken(sid):
+        raise RuntimeError("db locked")
+
+    store.load_transcript = broken
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy()):
+        assert _run(plugin._maybe_reset(event, gateway, store)) is None
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"  # the reset itself is unaffected
+    assert plugin._carry_pending == {}
+
+def test_typed_new_never_arms_carry_over(plugin, tmp_path):
+    store, key, gateway, reads = _carry_store(tmp_path)
+    event = _real_event("/new")
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy()):
+        _run(plugin._maybe_reset(event, gateway, store))
+    assert reads == [] and plugin._carry_pending == {}
+
+def test_carry_over_through_the_real_new_funnel(plugin, tmp_path, hook_recorder, monkeypatch):
+    store, key, _, reads = _carry_store(tmp_path)
+    gw, calls, slash_mod = _real_funnel_gateway(store, key)
+    monkeypatch.setattr(slash_mod, "t", lambda key_name, **kw: key_name)  # no i18n in tests
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy()):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+    new_sid = store.lookup_by_session_key(key).session_id
+    assert new_sid != "seed-sid" and calls.evicted == [key]
+    assert reads == [("seed-sid", "seed-sid")]
+    assert "session seed-sid" in plugin._carry_over_context(session_id=new_sid, platform="telegram")["context"]
