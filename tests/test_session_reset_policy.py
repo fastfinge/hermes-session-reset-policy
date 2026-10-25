@@ -211,7 +211,7 @@ def test_daily_without_min_idle_ignores_route_start(plugin):
     started = datetime(2026, 9, 25, 22, 0)
     assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 4, 27), datetime(2026, 9, 26, 10, 0), started) is None
 
-@pytest.mark.parametrize("bad", [-5, "180", None, True, [180]])
+@pytest.mark.parametrize("bad", [-5, "180", None, True, [180], float("nan"), float("inf"), float("-inf")])
 def test_daily_min_idle_malformed_means_no_minimum(plugin, bad):
     policy = {"mode": "daily", "at_hour": 4, "daily_min_idle_minutes": bad}
     assert plugin._time_reset_reason(policy, datetime(2026, 9, 26, 3, 59), datetime(2026, 9, 26, 4, 1)) == "daily"

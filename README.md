@@ -84,7 +84,7 @@ session_reset:
   daily_min_idle_minutes: 180   # daily cut only after >= 3 h without a user message
   carry_over:
     enabled: true               # default false
-    turns: 6                    # last user/assistant exchanges to show (1-20)
+    turns: 6                    # up to 12 recent user/assistant text messages (1-20 pairs)
     max_chars: 2500             # total excerpt budget (200-10000)
     max_age_hours: 24           # skip when the last user message is older
     pointer_turns: 3            # later model calls that get a 1-line pointer (0-20)

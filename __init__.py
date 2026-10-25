@@ -132,6 +132,7 @@ import contextlib
 import dataclasses
 import inspect
 import logging
+import math
 import re
 import threading
 import time
@@ -262,7 +263,8 @@ def _time_reset_reason(policy: Dict[str, Any], last: Optional[datetime], now: da
 def _daily_min_idle(policy: Dict[str, Any]) -> float:
     """``daily_min_idle_minutes`` as a non-negative float; 0 (no minimum) when unset or malformed."""
     value = policy.get("daily_min_idle_minutes", 0)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0):
         return 0.0
     return float(value)
 
