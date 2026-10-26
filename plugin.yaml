@@ -1,7 +1,7 @@
 name: hermes-session-reset-policy
 label: Session Reset Policy
 kind: standalone
-version: 0.3.1
+version: 0.4.0
 description: >
   Re-arms Hermes Agent's config-declared session_reset policy (idle/daily/both)
   as a plugin, after upstream v2026.9.11 stopped rotating conversations on
@@ -12,7 +12,10 @@ description: >
   session:end/session:reset + on_session_finalize/on_session_reset boundary
   hooks), so transcripts, routing, and state.db stay consistent. No timers, no
   background writes. Degrades to a bare store rotation when the funnel is
-  unreachable.
+  unreachable. Optional (session_reset.carry_over, off by default): the first
+  model call after a policy reset gets a short, redacted excerpt of the
+  previous conversation in the same chat plus a pointer to its session id.
 author: Samuel Proulx / fastfinge
 provides_hooks:
   - pre_gateway_dispatch
+  - pre_llm_call
