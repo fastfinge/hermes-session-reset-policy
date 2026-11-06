@@ -544,10 +544,11 @@ def _relabel_end_reason(gateway: Any, session_id: Optional[str], reason: str) ->
 # Nothing is written to disk: pending notes live in process memory and expire.
 
 _CARRY_LABEL = "[session-reset carry-over]"
-_CARRY_DEFAULTS = {"turns": 6, "max_chars": 2500, "max_age_hours": 24, "pointer_turns": 3,
-                   "session_search_hint": True}
 _CARRY_USER_CHARS = 300
 _CARRY_ASSISTANT_CHARS = 450
+_CARRY_DEFAULTS = {"turns": 6, "max_chars": 2500, "max_age_hours": 24, "pointer_turns": 3,
+                   "session_search_hint": True, "user_chars": _CARRY_USER_CHARS,
+                   "assistant_chars": _CARRY_ASSISTANT_CHARS}
 _CARRY_PENDING_TTL_S = 3600.0          # a note nobody picked up within an hour is dropped
 _CARRY_SKIP_PLATFORMS = frozenset({"cron", "subagent"})
 # Model-fed transcript rows that are not conversation: compaction summaries,
@@ -585,9 +586,11 @@ def _carry_over_config(policy: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             cfg[name] = kind(value)
 
     _num("turns", 1, 20, int)
-    _num("max_chars", 200, 10000, int)
+    _num("max_chars", 200, 50000, int)
     _num("max_age_hours", 0.1, 24 * 30, float)
     _num("pointer_turns", 0, 20, int)
+    _num("user_chars", 50, 10000, int)
+    _num("assistant_chars", 50, 10000, int)
     if isinstance(raw.get("session_search_hint"), bool):
         cfg["session_search_hint"] = raw["session_search_hint"]
     return cfg
@@ -643,7 +646,7 @@ def _build_carry_note(old_sid: str, reason: str, at: datetime, tail: list, cfg: 
     lines: list = []
     budget = cfg["max_chars"]
     for role, text in reversed(tail):
-        cap = _CARRY_USER_CHARS if role == "user" else _CARRY_ASSISTANT_CHARS
+        cap = cfg["user_chars"] if role == "user" else cfg["assistant_chars"]
         body = _redact(text)
         if len(body) > cap:
             body = body[:cap].rstrip() + " …"

@@ -1025,14 +1025,18 @@ def test_carry_over_config_off_by_default(plugin):
 def test_carry_over_config_defaults_and_shorthand(plugin):
     cfg = plugin._carry_over_config({"carry_over": True})
     assert cfg == {"turns": 6, "max_chars": 2500, "max_age_hours": 24.0, "pointer_turns": 3,
-                   "session_search_hint": True}
-    cfg = _carry_cfg(plugin, turns=2, max_chars=800, max_age_hours=6, pointer_turns=0, session_search_hint=False)
-    assert cfg == {"turns": 2, "max_chars": 800, "max_age_hours": 6.0, "pointer_turns": 0,
-                   "session_search_hint": False}
+                   "session_search_hint": True, "user_chars": 300, "assistant_chars": 450}
+    cfg = _carry_cfg(plugin, turns=2, max_chars=30000, max_age_hours=6, pointer_turns=0, session_search_hint=False,
+                     user_chars=1500, assistant_chars=3000)
+    assert cfg == {"turns": 2, "max_chars": 30000, "max_age_hours": 6.0, "pointer_turns": 0,
+                   "session_search_hint": False, "user_chars": 1500, "assistant_chars": 3000}
 
 def test_carry_over_config_out_of_range_falls_back(plugin):
-    cfg = _carry_cfg(plugin, turns=0, max_chars=50, max_age_hours=-1, pointer_turns=True)
+    cfg = _carry_cfg(plugin, turns=0, max_chars=50, max_age_hours=-1, pointer_turns=True,
+                     user_chars=10, assistant_chars=10**6)
     assert (cfg["turns"], cfg["max_chars"], cfg["max_age_hours"], cfg["pointer_turns"]) == (6, 2500, 24, 3)
+    assert (cfg["user_chars"], cfg["assistant_chars"]) == (300, 450)
+    assert _carry_cfg(plugin, max_chars=10**6)["max_chars"] == 2500
 
 def test_transcript_tail_is_text_only(plugin):
     tail = plugin._transcript_tail(_TRANSCRIPT, turns=6)
@@ -1069,6 +1073,13 @@ def test_carry_note_respects_caps_newest_first(plugin):
     assert all(len(ln) <= len("- Assistant: ") + plugin._CARRY_ASSISTANT_CHARS + 2 for ln in lines)
     assert sum(len(ln) + 1 for ln in lines) <= 600 + 1
     assert not any(ln.startswith("- User: uuu") for ln in lines)  # oldest dropped past the budget
+
+def test_carry_note_per_message_caps_are_configurable(plugin):
+    cfg = _carry_cfg(plugin, max_chars=10000, user_chars=1200, assistant_chars=2000)
+    tail = [("user", "u" * 5000), ("assistant", "a" * 5000)]
+    note = plugin._build_carry_note("old-sid", "idle", datetime(2026, 9, 26, 9, 0), tail, cfg)
+    lines = [ln for ln in note.splitlines() if ln.startswith("- ")]
+    assert lines == ["- User: " + "u" * 1200 + " …", "- Assistant: " + "a" * 2000 + " …"]
 
 def test_carry_over_context_note_then_pointers_then_nothing(plugin):
     cfg = _carry_cfg(plugin, pointer_turns=2)
