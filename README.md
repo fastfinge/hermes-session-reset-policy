@@ -85,7 +85,9 @@ session_reset:
   carry_over:
     enabled: true               # default false
     turns: 6                    # up to 12 recent user/assistant text messages (1-20 pairs)
-    max_chars: 2500             # total excerpt budget (200-10000)
+    max_chars: 2500             # total excerpt budget (200-50000)
+    user_chars: 300             # per-message cap for user turns (50-10000)
+    assistant_chars: 450        # per-message cap for assistant turns (50-10000)
     max_age_hours: 24           # skip when the last user message is older
     pointer_turns: 3            # later model calls that get a 1-line pointer (0-20)
     session_search_hint: true   # point the agent at session_search(session_id=...)
@@ -126,7 +128,8 @@ session id; after that, nothing. Scope and privacy:
 - only the route being reset, so never another chat, user or profile;
 - user and assistant text only: no tool calls, tool output, compaction
   summaries or system notes;
-- per-message caps (300 chars user, 450 assistant) and the `max_chars` budget,
+- per-message caps (`user_chars`, default 300; `assistant_chars`, default 450)
+  and the `max_chars` budget,
   newest turns first;
 - secrets redacted with Hermes' own redactor (forced on) plus a local fallback
   for common token shapes, URL secret parameters and `password: …` patterns;
