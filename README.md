@@ -14,7 +14,8 @@ without patching the core.
 ## How it works
 
 The plugin registers a `pre_gateway_dispatch` hook. On every inbound gateway
-message, before auth and dispatch, it:
+message — before dispatch, and before the gateway's own sender authorization,
+so it asks that question itself first (see *Authorization* below) — it:
 
 1. Resolves the session key for the message: the hook payload's `session_key`
    when the gateway provides one publicly, else the gateway's own
@@ -53,6 +54,18 @@ The event handed to the funnel is stripped of its text on purpose: the funnel
 treats `event.get_command_args()` as `/new <title>` — and on a plain message
 that returns the whole utterance, which would title the fresh session with
 whatever the user happened to send.
+
+Authorization (issue #17): `pre_gateway_dispatch` runs *before* the gateway's
+own sender authorization — that ordering is what lets plugins answer
+unauthorized senders at all — so the plugin asks the gateway's profile-aware
+`_is_user_authorized_for_source` itself (falling back to the older
+`_is_user_authorized`), and does nothing when the answer is no: no reset, no
+clock write. That matters for routes shared across senders
+(`group_sessions_per_user: false`, or a thread, which is shared by default):
+a message the gateway later rejects must not rotate or keep alive an
+authorized conversation. If the gateway exposes neither helper the plugin
+fails closed — resets are skipped and a warning is logged once — rather than
+treating an unverified sender as authorized.
 
 Because the trigger is the first *inbound message* past the boundary — never a
 timer — there are no background writes, no timer threads, and background/cron
@@ -175,7 +188,10 @@ Restart the gateway afterwards.
   gateway-side cache/scope teardown. A funnel that fails *after* rotating is
   never rotated a second time by the fallback.
 - Requires Hermes >= v2026.9.11 (needs the `pre_gateway_dispatch` hook payload
-  with `session_store`). Carry-over additionally uses the `pre_llm_call` hook
+  with `session_store`, and a sender-authorization helper —
+  `_is_user_authorized_for_source`, else the older `_is_user_authorized`;
+  without either, resets are skipped with a one-time warning, never
+  "authorized by default"). Carry-over additionally uses the `pre_llm_call` hook
   and `SessionStore.load_transcript`, both older than that, so it adds no
   version requirement. The full funnel path uses the gateway's private
   `_handle_reset_command` — deliberately reused until a public reset funnel

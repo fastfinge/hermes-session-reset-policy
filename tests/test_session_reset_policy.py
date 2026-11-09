@@ -37,6 +37,20 @@ def _run(coro):
     return asyncio.run(coro)
 
 
+class _Gw(SimpleNamespace):
+    """Minimal gateway double that carries what a real GatewayRunner always has.
+
+    ``pre_gateway_dispatch`` runs BEFORE the gateway's own sender authorization
+    (issue #17), so the plugin asks the gateway's profile-aware helper itself
+    before touching session state. A real runner inherits it from
+    ``GatewayAuthorizationMixin``; doubles must model that or every reset would
+    (correctly) fail closed.
+    """
+
+    def _is_user_authorized_for_source(self, source):
+        return True
+
+
 @pytest.fixture(autouse=True)
 def _temp_hermes_home(tmp_path, monkeypatch):
     """Redirect HERMES_HOME for every test.
@@ -334,7 +348,7 @@ def test_maybe_reset_store_fallback_calls_real_reset_session(plugin, tmp_path, h
     on_session_finalize / on_session_reset lifecycle pair."""
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120)
-    gateway = SimpleNamespace(
+    gateway = _Gw(
         _session_key_for_source=lambda src: key,
     )
     event = SimpleNamespace(source=_real_source(), internal=False)
@@ -371,7 +385,7 @@ def test_maybe_reset_prefers_the_gateway_funnel(plugin, tmp_path, hook_recorder)
     async def funnel(evt):
         seen.append(evt)
 
-    gateway = SimpleNamespace(
+    gateway = _Gw(
         _session_key_for_source=lambda src: key,
         _handle_reset_command=funnel,
     )
@@ -397,7 +411,7 @@ def test_maybe_reset_funnel_failure_before_rotation_falls_back(plugin, tmp_path,
     async def funnel(evt):
         raise RuntimeError("funnel exploded")
 
-    gateway = SimpleNamespace(
+    gateway = _Gw(
         _session_key_for_source=lambda src: key,
         _handle_reset_command=funnel,
     )
@@ -422,7 +436,7 @@ def test_maybe_reset_funnel_failure_after_rotation_keeps_result(plugin, tmp_path
         rotated_sid.append(store.reset_session(key).session_id)
         raise RuntimeError("banner exploded after the rotation")
 
-    gateway = SimpleNamespace(
+    gateway = _Gw(
         _session_key_for_source=lambda src: key,
         _handle_reset_command=funnel,
     )
@@ -441,7 +455,7 @@ def test_maybe_reset_prefers_payload_session_key(plugin, tmp_path):
     helper_key = "agent:main:telegram:dm:helper-chat"
     _seed_route(store, key=payload_key, updated_minutes_ago=5)
     _seed_route(store, key=helper_key, updated_minutes_ago=5)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: helper_key)
+    gateway = _Gw(_session_key_for_source=lambda src: helper_key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}  # within threshold -> clock-stamp path
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -461,7 +475,7 @@ def test_maybe_reset_bg_turn_does_not_block_reset(plugin, tmp_path, hook_recorde
     store.set_session_metadata(key, "srp_last_user_inbound",
                                (datetime.now() - timedelta(hours=2)).isoformat())
 
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -476,7 +490,7 @@ def test_maybe_reset_stamps_clock_when_within_threshold(plugin, tmp_path):
     not ``updated_at``."""
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=5)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     before = datetime.now() - timedelta(seconds=5)
@@ -493,7 +507,7 @@ def test_maybe_reset_deferral_does_not_advance_clock(plugin, tmp_path):
     next message re-evaluates the same boundary."""
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120, token="tok-123")
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -506,7 +520,7 @@ def test_maybe_reset_deferral_does_not_advance_clock(plugin, tmp_path):
 def test_maybe_reset_skips_when_within_threshold(plugin, tmp_path):
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=5)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -517,7 +531,7 @@ def test_maybe_reset_skips_when_within_threshold(plugin, tmp_path):
 def test_maybe_reset_defers_when_turn_in_flight(plugin, tmp_path):
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120, token="tok-123")
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -529,7 +543,7 @@ def test_maybe_reset_defers_when_turn_in_flight(plugin, tmp_path):
 def test_maybe_reset_no_policy_no_op(plugin, tmp_path):
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=100000)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=None):
         assert _run(plugin._maybe_reset(event, gateway, store)) is None
@@ -540,7 +554,7 @@ def test_maybe_reset_survives_store_errors(plugin, tmp_path):
         def lookup_by_session_key(self, key):
             raise RuntimeError("boom")
 
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: "agent:main:telegram:dm:x")
+    gateway = _Gw(_session_key_for_source=lambda src: "agent:main:telegram:dm:x")
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -548,7 +562,7 @@ def test_maybe_reset_survives_store_errors(plugin, tmp_path):
 
 def test_maybe_reset_no_route_no_op(plugin, tmp_path):
     store = _make_real_store(tmp_path)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: "agent:main:telegram:dm:none")
+    gateway = _Gw(_session_key_for_source=lambda src: "agent:main:telegram:dm:none")
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -561,7 +575,7 @@ def test_maybe_reset_survives_missing_key_helper(plugin, tmp_path):
     ANOTHER profile's route (review #2, item 4)."""
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120)
-    gateway = SimpleNamespace()  # no _session_key_for_source at all
+    gateway = _Gw()  # no _session_key_for_source at all
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -599,7 +613,7 @@ def _real_funnel_gateway(store, key):
     async def _finalize_session_off_loop(**kw):
         calls.finalize.append(kw)
 
-    gw = SimpleNamespace()
+    gw = _Gw()
     gw.session_store = store
     gw.async_session_store = session_mod.AsyncSessionStore(store)
     gw.hooks = _Hooks()
@@ -792,7 +806,7 @@ def test_maybe_reset_skips_slash_commands_past_boundary(plugin, tmp_path, text):
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120)
     funnel = mock.AsyncMock(side_effect=AssertionError("a command must not trigger a time reset"))
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key, _handle_reset_command=funnel)
+    gateway = _Gw(_session_key_for_source=lambda src: key, _handle_reset_command=funnel)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy), \
          mock.patch.object(store, "reset_session",
@@ -810,7 +824,7 @@ def test_maybe_reset_command_does_not_stamp_clock(plugin, tmp_path):
     periodic /status must not keep an otherwise idle session alive."""
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=5)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         assert _run(plugin._maybe_reset(_real_event("/status"), gateway, store)) is None
@@ -836,7 +850,7 @@ def test_path_like_message_is_not_a_command(plugin, tmp_path):
     async def funnel(evt):
         seen.append(evt)
 
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key, _handle_reset_command=funnel)
+    gateway = _Gw(_session_key_for_source=lambda src: key, _handle_reset_command=funnel)
     policy = {"mode": "idle", "idle_minutes": 60}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
         assert _run(plugin._maybe_reset(_real_event("/etc/hosts is broken"), gateway, store)) is None
@@ -924,7 +938,7 @@ def test_issue14_daily_reset_rotates_once_across_two_messages(plugin, tmp_path, 
     the replacement entry (#14)."""
     store = _make_real_store(tmp_path)
     key = "agent:main:telegram:dm:test-chat"
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     calls, first_sid = _two_messages_past_daily_boundary(
         plugin, store, gateway, tmp_path, monkeypatch, explode_after=False)
 
@@ -942,7 +956,7 @@ def test_issue14_clock_stamped_when_funnel_throws_after_rotating(plugin, tmp_pat
     rotates a second time."""
     store = _make_real_store(tmp_path)
     key = "agent:main:telegram:dm:test-chat"
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     calls, first_sid = _two_messages_past_daily_boundary(
         plugin, store, gateway, tmp_path, monkeypatch, explode_after=True)
 
@@ -961,7 +975,7 @@ def test_relabel_end_reason_keeps_policy_reset_out_of_user_boundaries(plugin, tm
     db.end_session("s-reset", "session_reset")
     db.create_session("s-exit", "discord")
     db.end_session("s-exit", "user_exit")
-    gateway = SimpleNamespace(_session_db=hermes_state.AsyncSessionDB(db))
+    gateway = _Gw(_session_db=hermes_state.AsyncSessionDB(db))
 
     plugin._relabel_end_reason(gateway, "s-reset", "idle")
     plugin._relabel_end_reason(gateway, "s-exit", "idle")
@@ -1004,7 +1018,7 @@ def test_maybe_reset_daily_min_idle_deferred_cut_end_to_end(plugin, tmp_path, mo
     key, entry = _seed_route(store)
     entry.created_at = datetime(2026, 9, 25, 22, 0)
     store.set_session_metadata(key, "srp_last_user_inbound", datetime(2026, 9, 26, 4, 27).isoformat())
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     policy = {"mode": "daily", "at_hour": 4, "daily_min_idle_minutes": 180}
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
@@ -1123,7 +1137,7 @@ def _carry_store(tmp_path, *, updated_minutes_ago=120):
         return list(_TRANSCRIPT)
 
     store.load_transcript = load_transcript
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     return store, key, gateway, reads
 
 def test_carry_over_armed_by_policy_reset(plugin, tmp_path):
@@ -1161,7 +1175,7 @@ def test_carry_over_not_armed_without_rotation(plugin, tmp_path):
     store = _make_real_store(tmp_path)
     key, entry = _seed_route(store, updated_minutes_ago=120, token="turn-1")
     store.load_transcript = lambda sid: list(_TRANSCRIPT)
-    gateway = SimpleNamespace(_session_key_for_source=lambda src: key)
+    gateway = _Gw(_session_key_for_source=lambda src: key)
     event = SimpleNamespace(source=_real_source(), internal=False)
     with mock.patch.object(plugin, "_read_session_reset_policy", return_value=_carry_policy()):
         _run(plugin._maybe_reset(event, gateway, store))
@@ -1199,3 +1213,208 @@ def test_carry_over_through_the_real_new_funnel(plugin, tmp_path, hook_recorder,
     assert new_sid != "seed-sid" and calls.evicted == [key]
     assert reads == [("seed-sid", "seed-sid")]
     assert "session seed-sid" in plugin._carry_over_context(session_id=new_sid, platform="telegram")["context"]
+
+
+# ---------------------------------------------------------------------------
+# Issue #17: pre_gateway_dispatch runs BEFORE the gateway authorizes the
+# sender, so a message the gateway is about to reject can still reach this
+# hook. It must not rotate a route or advance the activity clock. The harm
+# needs a route SHARED across senders (group_sessions_per_user: false, or a
+# thread, which is shared by default): that route belongs to an authorized
+# conversation, and rotating/keeping it alive from a rejected message is the
+# bug. A per-sender route would not exist for a stranger, hence no impact.
+# ---------------------------------------------------------------------------
+
+def _shared_group_route(user_id="mallory"):
+    """The session key an unauthorized sender resolves to in a shared group."""
+    session_mod = _import_tree_module("gateway.session")
+    cfg = _import_tree_module("gateway.config")
+    source = session_mod.SessionSource(
+        platform=cfg.Platform.TELEGRAM, chat_id="shared-group", chat_type="group",
+        user_id=user_id)
+    return session_mod.build_session_key(source, group_sessions_per_user=False), source
+
+
+def _gateway_with_verdict(key, verdict):
+    """Gateway double whose authorization records the source it was asked about."""
+    gw = _Gw(_session_key_for_source=lambda src: key)
+    seen = []
+
+    def _authorize(source):
+        seen.append(source)
+        return verdict
+
+    gw._is_user_authorized_for_source = _authorize
+    return gw, seen
+
+
+def test_issue17_rejected_sender_past_daily_boundary_changes_nothing(plugin, tmp_path, monkeypatch):
+    """The reporter's first case: clock at 03:00, 04:00 boundary, message at
+    08:00 from a sender the gateway will reject. No rotation, no clock write."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _key, entry = _seed_route(store, key=key, updated_minutes_ago=30)
+    entry.created_at = datetime(2026, 9, 25, 12, 0)
+    store.set_session_metadata(key, "srp_last_user_inbound", datetime(2026, 9, 26, 3, 0).isoformat())
+    gw, seen = _gateway_with_verdict(key, verdict=False)
+    gw._handle_reset_command = mock.AsyncMock(
+        side_effect=AssertionError("a rejected sender must not reach the reset funnel"))
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "daily", "at_hour": 4}
+    _freeze_plugin_now(plugin, monkeypatch, datetime(2026, 9, 26, 8, 0))
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    # The gateway's own profile-aware helper was asked, with the SAME source.
+    assert seen == [source]
+    assert gw._handle_reset_command.await_count == 0
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.get_session_metadata(key, "srp_last_user_inbound") == datetime(2026, 9, 26, 3, 0).isoformat()
+
+
+def test_issue17_rejected_sender_within_boundary_does_not_stamp_clock(plugin, tmp_path):
+    """The reporter's second case: within the boundary the message must not
+    advance ``srp_last_user_inbound`` either — that alone keeps an authorized
+    conversation alive forever against a stream of rejected messages."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _seed_route(store, key=key, updated_minutes_ago=5)
+    gw, seen = _gateway_with_verdict(key, verdict=False)
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    assert seen == [source]
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+
+
+def test_issue17_authorized_sender_in_shared_route_still_resets(plugin, tmp_path):
+    """Authorized ordinary inbound keeps the historical behavior on the very
+    same shared route: one rotation, then the fresh entry's clock stamp."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route(user_id="alice")
+    _seed_route(store, key=key, updated_minutes_ago=120)
+    gw, seen = _gateway_with_verdict(key, verdict=True)
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    assert seen == [source]
+    new_entry = store.lookup_by_session_key(key)
+    assert new_entry.session_id != "seed-sid"
+    assert new_entry.is_fresh_reset is True
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is not None
+
+
+def test_issue17_authorization_is_profile_aware(plugin, tmp_path):
+    """The source is handed to the gateway's PROFILE-AWARE check unchanged: its
+    ``profile`` stamp still decides which profile's allowlist applies. Rewriting
+    or re-deriving the source here would authorize under the wrong profile."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _seed_route(store, key=key, updated_minutes_ago=120)
+    source.profile = "mom"
+    gw = _Gw(_session_key_for_source=lambda src: key)
+    gw._is_user_authorized_for_source = lambda source: getattr(source, "profile", None) != "mom"
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+        assert store.lookup_by_session_key(key).session_id == "seed-sid"
+        source.profile = None  # the same sender, now authorized under the default profile
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"
+
+
+def test_issue17_missing_authorization_helper_fails_closed(plugin, tmp_path, monkeypatch, caplog):
+    """No helper at all (older/renamed tree): skip every reset and say so ONCE.
+    Treating an unverified sender as authorized is exactly what #17 objects to."""
+    monkeypatch.setattr(plugin, "_auth_helper_warned", False)
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _seed_route(store, key=key, updated_minutes_ago=120)
+    gw = SimpleNamespace(_session_key_for_source=lambda src: key)  # no authorization API
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with caplog.at_level("WARNING", logger="hermes.plugins.session_reset_policy"), \
+         mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+    warnings = [r for r in caplog.records if "no source-authorization helper" in r.getMessage()]
+    assert len(warnings) == 1  # once, not per message
+
+
+def test_issue17_authorization_error_fails_closed(plugin, tmp_path):
+    """A throwing authorization check must not fall through to a reset."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _seed_route(store, key=key, updated_minutes_ago=120)
+    gw = _Gw(_session_key_for_source=lambda src: key)
+
+    def _broken(source):
+        raise RuntimeError("allowlist unreadable")
+
+    gw._is_user_authorized_for_source = _broken
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+
+
+def test_issue17_falls_back_to_the_unwrapped_helper(plugin, tmp_path):
+    """Trees that predate ``_is_user_authorized_for_source`` still get gated by
+    the older ``_is_user_authorized`` rather than being treated as authorized."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _seed_route(store, key=key, updated_minutes_ago=120)
+    gw = SimpleNamespace(_session_key_for_source=lambda src: key,
+                         _is_user_authorized=lambda src: False)
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+
+    gw._is_user_authorized = lambda src: True
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"
+
+
+def test_issue17_async_authorization_helper_fails_closed(plugin, tmp_path):
+    """A coroutine object is truthy; never let an unsupported async helper
+    silently authorize every sender."""
+    store = _make_real_store(tmp_path)
+    key, source = _shared_group_route()
+    _seed_route(store, key=key, updated_minutes_ago=120)
+    gw = _Gw(_session_key_for_source=lambda src: key)
+
+    async def _authorize(source):
+        return True
+
+    setattr(gw, "_is_user_authorized_for_source", _authorize)  # unsupported shape, on purpose
+    event = SimpleNamespace(source=source, internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
+
+    assert store.lookup_by_session_key(key).session_id == "seed-sid"
+    assert store.get_session_metadata(key, "srp_last_user_inbound") is None
+
