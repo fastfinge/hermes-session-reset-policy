@@ -54,6 +54,21 @@ treats ``event.get_command_args()`` as ``/new <title>``, and on a plain
 message that returns the whole utterance — left intact, a policy reset would
 title the fresh session with whatever the user happened to send.
 
+Authorization (issue #17)
+-------------------------
+``pre_gateway_dispatch`` runs BEFORE the gateway's own sender authorization —
+deliberately, so plugins can answer unauthorized senders themselves. This
+plugin asks the same question first, through the gateway's profile-aware
+``_is_user_authorized_for_source`` (the transport profile's allowlist decides,
+not the routed runtime's), falling back to the older ``_is_user_authorized`` for
+trees that predate the wrapper. A sender the gateway will reject changes
+nothing: no reset, no clock write. That matters because a rejected message can
+resolve to an existing SHARED route — a group with
+``group_sessions_per_user: false``, or a thread, which is shared by default —
+where the route belongs to an authorized conversation. If the gateway exposes
+neither helper, the plugin fails closed (skips resets) and says so once,
+rather than treating an unverified sender as authorized.
+
 Migration: routes that predate the plugin have no metadata clock; their first
 hook-seen message falls back to ``updated_at``/``created_at`` once, then the
 metadata clock takes over.
@@ -107,7 +122,10 @@ in memory only; skipped when the last user activity is older than
 Compatibility notes
 -------------------
 - Requires Hermes >= v2026.9.11 (needs ``pre_gateway_dispatch`` hook payload
-  with ``session_store``, and ``SessionStore.reset_session``). The full funnel
+  with ``session_store``, ``SessionStore.reset_session``, and a source
+  authorization helper — ``_is_user_authorized_for_source``, else the older
+  ``_is_user_authorized``; without either, resets are skipped and a one-time
+  warning is logged, never "authorized by default"). The full funnel
   path additionally uses ``gateway._handle_reset_command`` (present ever since
   ``/new`` exists; private, per review #2 reused deliberately until a public
   reset funnel exists).
@@ -141,9 +159,14 @@ from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 _META_KEY = "srp_last_user_inbound"
+
+# Source authorization (issue #17): the gateway's profile-aware wrapper first,
+# the older unwrapped name only as a fallback for trees that predate it.
+_AUTH_HELPERS = ("_is_user_authorized_for_source", "_is_user_authorized")
+_auth_helper_warned = False
 
 
 def _read_session_reset_policy(profile: Optional[str]) -> Optional[Dict[str, Any]]:
@@ -307,6 +330,68 @@ def _is_slash_command(event: Any) -> bool:
     return isinstance(text, str) and text.lstrip().startswith("/")
 
 
+def _source_authorized(gateway: Any, source: Any) -> Optional[bool]:
+    """The gateway's own verdict on whether *source* may reach the agent, or None.
+
+    ``pre_gateway_dispatch`` runs BEFORE the gateway authorizes the sender
+    (``gateway/run_inbound.py``: the hook, then
+    ``_is_user_authorized_for_source``) precisely so plugins can handle
+    unauthorized senders themselves. This plugin only rotates/stamps a route,
+    so it must ask the gateway's own question first: an unauthorized sender's
+    message is not user activity and must not rotate or keep alive the route
+    it resolves to — in a shared group/thread route that route is an
+    authorized conversation's (issue #17).
+
+    ``_is_user_authorized_for_source`` is the profile-aware wrapper: it
+    authorizes under the transport's profile (the source is stamped with the
+    transport home for the read), not the routed runtime, which need not copy
+    the shared bot token/allowlist. ``_is_user_authorized`` is the older,
+    unwrapped name, kept only as a fallback for trees that predate the
+    wrapper. ``None`` means the gateway exposes neither — the caller fails
+    closed rather than guessing "authorized".
+    """
+    for name in _AUTH_HELPERS:
+        helper = getattr(gateway, name, None)
+        if not callable(helper):
+            continue
+        try:
+            verdict = helper(source)
+        except Exception:
+            logger.warning(
+                "session-reset-policy: %s failed while authorizing an inbound message; "
+                "treating the sender as unauthorized", name, exc_info=True,
+            )
+            return False
+        if inspect.isawaitable(verdict):
+            # A truthy coroutine object would authorize EVERY sender. This hook
+            # is async, but the check is deliberately called synchronously here;
+            # an async helper is unsupported, and unsupported fails closed.
+            logger.warning(
+                "session-reset-policy: %s returned an awaitable instead of a verdict; "
+                "treating the sender as unauthorized", name,
+            )
+            close = getattr(verdict, "close", None)
+            if callable(close):
+                close()  # no "coroutine was never awaited" noise
+            return False
+        return bool(verdict)
+    return None
+
+
+def _warn_missing_authorization() -> None:
+    """Say once why every reset is being skipped; never spam per message."""
+    global _auth_helper_warned
+    if _auth_helper_warned:
+        return
+    _auth_helper_warned = True
+    logger.warning(
+        "session-reset-policy: gateway exposes no source-authorization helper "
+        "(_is_user_authorized_for_source/_is_user_authorized); skipping time-based "
+        "resets. Refusing to treat an unverified sender as authorized (issue #17); "
+        "this plugin expects Hermes >= v2026.9.11, where the helper exists.",
+    )
+
+
 def _resolve_session_key(gateway: Any, source: Any, from_payload: Optional[str]) -> Optional[str]:
     """The routing key for *source*: the hook payload's ``session_key`` when a
     future Hermes exposes one publicly, else ``gateway._session_key_for_source``.
@@ -435,6 +520,27 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         # Bookkeeping, not conversation (module docstring, "Slash commands"):
         # no clock stamp, no time reset. /new and /reset rotate the route
         # themselves; resetting here first would rotate it twice.
+        return None
+    authorized = _source_authorized(gateway, source)
+    if authorized is not True:
+        # pre_gateway_dispatch runs BEFORE the gateway's own sender
+        # authorization (that is why plugins can answer unauthorized senders
+        # at all), so a sender the gateway is about to reject still reaches
+        # this hook. Its message is not user activity: it must neither rotate
+        # the route nor advance the activity clock. In a shared group/thread
+        # route (``group_sessions_per_user: false``, or a thread, which is
+        # shared by default) that route belongs to an authorized
+        # conversation, so the rejected message would otherwise reset or
+        # keep alive someone else's session (issue #17). An unknown verdict
+        # (no helper on the gateway) fails closed: never treat an unverified
+        # sender as authorized.
+        if authorized is None:
+            _warn_missing_authorization()
+        else:
+            logger.debug(
+                "session-reset-policy: sender not authorized for %s; no reset or clock write",
+                getattr(source, "platform", "?"),
+            )
         return None
 
     profile = getattr(source, "profile", None)
