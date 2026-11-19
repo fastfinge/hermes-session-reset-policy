@@ -426,6 +426,12 @@ class _CommandFreeEvent:
     def get_command_args(self) -> str:
         return ""
 
+    def accept_interrupt(self) -> None:
+        """The reset funnel marks its triggering event accepted before rotating (Hermes v0.23.2's
+        /stop-visibility contract). This source-only surrogate is not the adapter-dispatched
+        event and has no adapter observer, so it does not record or forward interrupt
+        acceptance."""
+
 
 def _command_free_event(event: Any) -> Any:
     """A copy of *event* that reads as a bare command with no arguments.
