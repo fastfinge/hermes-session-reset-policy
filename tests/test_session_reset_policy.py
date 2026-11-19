@@ -16,6 +16,7 @@ Standalone-suite discipline (per the platform-plugin skill):
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib.util
 import os
 import sys
@@ -632,9 +633,20 @@ def _real_funnel_gateway(store, key):
     async def _hm_stop_owner_turn(k):
         calls.stopped.append(k)
     gw._hm_stop_owner_turn = _hm_stop_owner_turn
+    # v0.23.2 scopes the /new event hooks to the owning profile; a single-profile stand-in needs no
+    # runtime scope.
+    gw._async_profile_scope_for_source = lambda source: contextlib.nullcontext()
+    # v0.23.2 fires on_session_reset through _fire_plugin_session_reset -> _reset_session_off_loop,
+    # which runs invoke_hook off-loop under the owner's scope; the stand-in calls it directly.
+    async def _reset_session_off_loop(*, session_key=None, **kw):
+        from hermes_cli.lifecycle import invoke_hook
+        invoke_hook("on_session_reset", **kw)
+    gw._reset_session_off_loop = _reset_session_off_loop
     for name in ("_handle_reset_command", "_fire_session_reset_hooks",
                  "_cleanup_old_agent_for_reset"):
         setattr(gw, name, getattr(mixin, name).__get__(gw))
+    if hasattr(mixin, "_fire_plugin_session_reset"):  # v0.23.2+; older trees fire the hook inline
+        gw._fire_plugin_session_reset = mixin._fire_plugin_session_reset.__get__(gw)
     return gw, calls, slash_mod
 
 
