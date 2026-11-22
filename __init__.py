@@ -155,7 +155,7 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
@@ -426,6 +426,12 @@ class _CommandFreeEvent:
     def get_command_args(self) -> str:
         return ""
 
+    def accept_interrupt(self) -> None:
+        """The reset funnel marks its triggering event accepted before rotating (Hermes v0.23.2's
+        /stop-visibility contract). This source-only surrogate is not the adapter-dispatched
+        event and has no adapter observer, so it does not record or forward interrupt
+        acceptance."""
+
 
 def _command_free_event(event: Any) -> Any:
     """A copy of *event* that reads as a bare command with no arguments.
@@ -607,6 +613,44 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
     return None  # always allow normal dispatch; the fresh session picks the message up
 
 
+def _session_db_writer(gateway: Any) -> Optional[Callable[..., Any]]:
+    """The gateway session DB's serialized writer, across Hermes storage layouts, or None.
+
+    - up to v0.23.2: ``gateway._session_db`` is an ``AsyncSessionDB`` over a ``SessionDB`` that has
+      ``_execute_write`` itself;
+    - v0.23.3+: the storage interface. ``gateway._session_db`` is a store handle (``Persistence`` /
+      ``SQLiteStore``) whose ``holder()`` carries ``_execute_write``; the deprecated
+      ``hermes_state.SessionDB`` shim wraps such a handle as ``_store``.
+
+    Without this, v0.23.3 found no ``_execute_write`` and the relabel silently did nothing: a policy
+    reset stayed ``session_reset`` (a user boundary) and in-flight async completions were dropped.
+    """
+    db = getattr(gateway, "_session_db", None)
+    if db is None:
+        return None
+    db = getattr(db, "_db", db)          # AsyncSessionDB -> SessionDB (any version)
+    write = getattr(db, "_execute_write", None)
+    if callable(write):
+        return write
+    store = getattr(db, "_store", None) or db       # v0.23.3 SessionDB shim -> its Persistence handle
+    bind = getattr(store, "_bound_store", None)     # Persistence forwards a closed list: bind the SQLiteStore
+    if callable(bind):
+        try:
+            store = bind()
+        except Exception:
+            logger.debug("session-reset-policy: session store handle unavailable", exc_info=True)
+            return None
+    holder = getattr(store, "holder", None)
+    if not callable(holder):
+        return None
+    try:
+        write = getattr(holder(), "_execute_write", None)
+    except Exception:
+        logger.debug("session-reset-policy: session store holder unavailable", exc_info=True)
+        return None
+    return write if callable(write) else None
+
+
 def _relabel_end_reason(gateway: Any, session_id: Optional[str], reason: str) -> None:
     """Record the timed boundary ("idle"/"daily") instead of the funnel's "session_reset".
 
@@ -617,10 +661,8 @@ def _relabel_end_reason(gateway: Any, session_id: Optional[str], reason: str) ->
     """
     if not session_id:
         return
-    db = getattr(gateway, "_session_db", None)
-    db = getattr(db, "_db", db)
-    write = getattr(db, "_execute_write", None)
-    if not callable(write):
+    write = _session_db_writer(gateway)
+    if write is None:
         return
     try:
         write(lambda conn: conn.execute(
