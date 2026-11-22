@@ -4,3 +4,7 @@ ruamel.yaml
 # Imported transitively by the Hermes-tree modules the tests bind the real
 # /new funnel from (gateway.slash_commands_session -> gateway.platforms.base).
 httpx
+# Imported transitively as well: on Hermes v0.23.3 the real /new funnel reaches
+# gateway.run -> hermes_cli.env_loader, which imports dotenv at module level
+# (deliberately, so a wiped install fails there).
+python-dotenv
