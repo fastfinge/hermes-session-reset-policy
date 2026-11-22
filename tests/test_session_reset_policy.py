@@ -998,6 +998,43 @@ def test_relabel_end_reason_keeps_policy_reset_out_of_user_boundaries(plugin, tm
     assert db.get_session("s-exit")["end_reason"] == "user_exit"
 
 
+def test_relabel_end_reason_reaches_the_storage_interface_handle(plugin, tmp_path):
+    """Hermes v0.23.3+: ``gateway._session_db`` is a storage-interface handle (``open_persistence``), with no
+    ``_execute_write`` of its own and ``holder`` not forwarded by ``Persistence``. The relabel must still land,
+    or a policy reset stays ``session_reset`` (a user boundary) and in-flight async completions are dropped.
+    On a tree without the storage interface (<= v0.23.2) the legacy ``SessionDB`` path is exercised instead,
+    so the test never skips on either side of the change."""
+    sys.path.insert(0, str(HERMES_TREE))
+    try:
+        assembly = importlib.import_module("persistence_assembly")
+    except ImportError:
+        assembly = None
+    if assembly is None:
+        hermes_state = _import_tree_module("hermes_state")
+        db = hermes_state.SessionDB(tmp_path / "state.db")
+        db.create_session("s-reset", "telegram")
+        db.end_session("s-reset", "session_reset")
+        plugin._relabel_end_reason(_Gw(_session_db=hermes_state.AsyncSessionDB(db)), "s-reset", "daily")
+        assert db.get_session("s-reset")["end_reason"] == "daily"
+        return
+    sessions_mod = _import_tree_module("persistence.conversation.sessions")
+    handle = assembly.open_persistence(assembly.profile_scope(), eager=True)
+    try:
+        handle.sessions.create(sessions_mod.NewSession(session_id="s-reset", source="telegram"))
+        handle.sessions.end("s-reset", "session_reset")
+        handle.sessions.create(sessions_mod.NewSession(session_id="s-exit", source="telegram"))
+        handle.sessions.end("s-exit", "user_exit")
+        gateway = _Gw(_session_db=handle)
+
+        plugin._relabel_end_reason(gateway, "s-reset", "daily")
+        plugin._relabel_end_reason(gateway, "s-exit", "daily")
+
+        assert handle.sessions.get("s-reset").end_reason == "daily"
+        assert handle.sessions.get("s-exit").end_reason == "user_exit"
+    finally:
+        handle.close()
+
+
 # ---------------------------------------------------------------------------
 # carry_over — optional excerpt of the previous conversation after a policy
 # reset (config parsing, transcript filtering, note shape, pre_llm_call
