@@ -8,10 +8,12 @@ on:
 env:
   # The integration tests import the real gateway SessionStore/SessionEntry
   # and bind the real /new reset funnel (GatewaySessionCommandsMixin).
-  # Pinned to hermes-agent main as of 2026-09-27 (9a0a1625); the full suite
-  # was re-run locally against this tree. Bump deliberately and re-run
-  # locally against the new tree before moving it.
-  HERMES_REF: 9a0a1625367242596d338ae2da541c4a1fc785a2
+  # Pinned to the v0.23.3 release (caafe538), which moves the gateway session
+  # DB onto the storage interface (persistence_assembly.open_persistence): the
+  # suite must exercise that layout, or a relabel that silently no-ops there
+  # passes CI. Re-ran the full suite locally on 3.13 and 3.14 against a clean
+  # v0.23.3 worktree (83 passed) before moving the pin.
+  HERMES_REF: caafe5389ae585ef77387a962aee05b1bcf17029
 
 jobs:
   pytest:
