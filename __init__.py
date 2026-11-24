@@ -54,6 +54,20 @@ treats ``event.get_command_args()`` as ``/new <title>``, and on a plain
 message that returns the whole utterance — left intact, a policy reset would
 title the fresh session with whatever the user happened to send.
 
+Session boundary ownership
+--------------------------
+The old session's row is core's: the reset goes through the same funnel a typed
+``/new`` does, so core records its own ``session_reset`` end reason and this
+plugin does not rewrite it. A plugin must not write core session state behind
+core's back, even fail-open (the review on the 0.4.2 catalog bump,
+NousResearch/hermes-agent#158942). One consequence: the gateway treats
+``session_reset`` as a user boundary, so async
+delegation completions still bound for the old session are dropped rather than
+delivered — the reason 0.4.2 relabelled the row through raw SQL. That relabel
+is gone. Upstream issue #159667 asks the reset path to take an end reason
+(``idle``/``daily``) so a policy reset can be distinguished without touching
+storage; this plugin will switch to that public parameter once it ships.
+
 Authorization (issue #17)
 -------------------------
 ``pre_gateway_dispatch`` runs BEFORE the gateway's own sender authorization —
@@ -155,11 +169,11 @@ import re
 import threading
 import time
 from datetime import datetime, timedelta
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Dict, Optional
 
 logger = logging.getLogger("hermes.plugins.session_reset_policy")
 
-__version__ = "0.4.1"
+__version__ = "0.4.3"
 
 _META_KEY = "srp_last_user_inbound"
 
@@ -588,7 +602,6 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
             key, exc_info=True,
         )
         return None
-    _relabel_end_reason(gateway, old_sid, reason)
     new_sid = getattr(new_entry, "session_id", None) if new_entry is not None else None
     if new_entry is not None and new_sid != old_sid:
         # Confirmed rotation (including a funnel that threw after having
@@ -611,65 +624,6 @@ async def _maybe_reset(event: Any, gateway: Any, session_store: Any,
         key, reason, new_sid or "?",
     )
     return None  # always allow normal dispatch; the fresh session picks the message up
-
-
-def _session_db_writer(gateway: Any) -> Optional[Callable[..., Any]]:
-    """The gateway session DB's serialized writer, across Hermes storage layouts, or None.
-
-    - up to v0.23.2: ``gateway._session_db`` is an ``AsyncSessionDB`` over a ``SessionDB`` that has
-      ``_execute_write`` itself;
-    - v0.23.3+: the storage interface. ``gateway._session_db`` is a store handle (``Persistence`` /
-      ``SQLiteStore``) whose ``holder()`` carries ``_execute_write``; the deprecated
-      ``hermes_state.SessionDB`` shim wraps such a handle as ``_store``.
-
-    Without this, v0.23.3 found no ``_execute_write`` and the relabel silently did nothing: a policy
-    reset stayed ``session_reset`` (a user boundary) and in-flight async completions were dropped.
-    """
-    db = getattr(gateway, "_session_db", None)
-    if db is None:
-        return None
-    db = getattr(db, "_db", db)          # AsyncSessionDB -> SessionDB (any version)
-    write = getattr(db, "_execute_write", None)
-    if callable(write):
-        return write
-    store = getattr(db, "_store", None) or db       # v0.23.3 SessionDB shim -> its Persistence handle
-    bind = getattr(store, "_bound_store", None)     # Persistence forwards a closed list: bind the SQLiteStore
-    if callable(bind):
-        try:
-            store = bind()
-        except Exception:
-            logger.debug("session-reset-policy: session store handle unavailable", exc_info=True)
-            return None
-    holder = getattr(store, "holder", None)
-    if not callable(holder):
-        return None
-    try:
-        write = getattr(holder(), "_execute_write", None)
-    except Exception:
-        logger.debug("session-reset-policy: session store holder unavailable", exc_info=True)
-        return None
-    return write if callable(write) else None
-
-
-def _relabel_end_reason(gateway: Any, session_id: Optional[str], reason: str) -> None:
-    """Record the timed boundary ("idle"/"daily") instead of the funnel's "session_reset".
-
-    The gateway treats "session_reset" as a USER boundary (like /new) and terminally drops any
-    async delegation completion still bound for the old session. A policy reset is not the user
-    closing the conversation, so its in-flight results must still be delivered. "idle"/"daily"
-    are recognised reset reasons (history stays closed) that are not user boundaries.
-    """
-    if not session_id:
-        return
-    write = _session_db_writer(gateway)
-    if write is None:
-        return
-    try:
-        write(lambda conn: conn.execute(
-            "UPDATE sessions SET end_reason = ? WHERE id = ? AND end_reason = 'session_reset'",
-            (reason, session_id)))
-    except Exception:
-        logger.debug("session-reset-policy: end_reason relabel failed for %s", session_id, exc_info=True)
 
 
 # ---------------------------------------------------------------------------

@@ -182,6 +182,14 @@ Restart the gateway afterwards.
 - Boundary hooks keep firing downstream (`session:end`/`session:reset`,
   `on_session_finalize`/`on_session_reset`) — the reset goes through the /new
   funnel, not around it.
+- The old session's row is core's. The reset records core's own `session_reset`
+  end reason, exactly as a typed `/new` does; the plugin does not rewrite it
+  (plugins must not write core session state). One consequence: async
+  delegation completions still bound for the old session are dropped, because
+  the gateway treats `session_reset` as a user boundary. Upstream issue
+  [#159667](https://github.com/NousResearch/hermes-agent/issues/159667) asks
+  the reset path to take an end reason (`idle`/`daily`); once that ships this
+  plugin will pass it and those completions will be delivered again.
 - When the funnel is unreachable (older gateways, renamed internals) the
   plugin degrades to a bare `SessionStore.reset_session()` plus the lifecycle
   hook pair and the delegation interrupt: a consistent rotation without the

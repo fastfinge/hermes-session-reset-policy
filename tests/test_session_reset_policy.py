@@ -977,62 +977,36 @@ def test_issue14_clock_stamped_when_funnel_throws_after_rotating(plugin, tmp_pat
     assert store.get_session_metadata(key, "pending_work") == {"queue": "review", "id": 7}
 
 
-def test_relabel_end_reason_keeps_policy_reset_out_of_user_boundaries(plugin, tmp_path):
-    """A policy reset rotates through the /new funnel, which records ``session_reset`` — a user
-    boundary that terminally drops in-flight async completions for the old session. The plugin
-    relabels it to its own timed reason, and leaves any other end reason alone."""
-    hermes_state = _import_tree_module("hermes_state")
-    db = hermes_state.SessionDB(tmp_path / "state.db")
-    db.create_session("s-reset", "discord")
-    db.end_session("s-reset", "session_reset")
-    db.create_session("s-exit", "discord")
-    db.end_session("s-exit", "user_exit")
-    gateway = _Gw(_session_db=hermes_state.AsyncSessionDB(db))
+def test_policy_reset_does_not_write_core_session_state(plugin, tmp_path, hook_recorder, monkeypatch):
+    """The old session's row belongs to core: a policy reset goes through the /new funnel and keeps
+    core's own ``session_reset`` end reason. The plugin must not rewrite it (the review on the 0.4.2
+    catalog bump, NousResearch/hermes-agent#158942: no plugin writes core session state, even
+    fail-open).
 
-    plugin._relabel_end_reason(gateway, "s-reset", "idle")
-    plugin._relabel_end_reason(gateway, "s-exit", "idle")
-    plugin._relabel_end_reason(gateway, None, "idle")
-    plugin._relabel_end_reason(SimpleNamespace(), "s-reset", "daily")  # no DB: no-op
+    Dropped in-flight async completions are the accepted cost of that rule; upstream's request for a
+    reset path that takes an end reason (``idle``/``daily``) is the supported way back in.
+    """
+    assert not hasattr(plugin, "_session_db_writer")
+    assert not hasattr(plugin, "_relabel_end_reason")
 
-    assert db.get_session("s-reset")["end_reason"] == "idle"
-    assert db.get_session("s-exit")["end_reason"] == "user_exit"
+    store = _make_real_store(tmp_path)
+    key, _entry = _seed_route(store, updated_minutes_ago=120)
+    gw, _calls, slash_mod = _real_funnel_gateway(store, key)
+    monkeypatch.setattr(slash_mod, "t", lambda key_name, **kw: key_name)
 
+    class _CoreSessionDB:
+        """Any reach into core's session storage from the plugin is the regression."""
 
-def test_relabel_end_reason_reaches_the_storage_interface_handle(plugin, tmp_path):
-    """Hermes v0.23.3+: ``gateway._session_db`` is a storage-interface handle (``open_persistence``), with no
-    ``_execute_write`` of its own and ``holder`` not forwarded by ``Persistence``. The relabel must still land,
-    or a policy reset stays ``session_reset`` (a user boundary) and in-flight async completions are dropped.
-    On a tree without the storage interface (<= v0.23.2) the legacy ``SessionDB`` path is exercised instead,
-    so the test never skips on either side of the change."""
-    sys.path.insert(0, str(HERMES_TREE))
-    try:
-        assembly = importlib.import_module("persistence_assembly")
-    except ImportError:
-        assembly = None
-    if assembly is None:
-        hermes_state = _import_tree_module("hermes_state")
-        db = hermes_state.SessionDB(tmp_path / "state.db")
-        db.create_session("s-reset", "telegram")
-        db.end_session("s-reset", "session_reset")
-        plugin._relabel_end_reason(_Gw(_session_db=hermes_state.AsyncSessionDB(db)), "s-reset", "daily")
-        assert db.get_session("s-reset")["end_reason"] == "daily"
-        return
-    sessions_mod = _import_tree_module("persistence.conversation.sessions")
-    handle = assembly.open_persistence(assembly.profile_scope(), eager=True)
-    try:
-        handle.sessions.create(sessions_mod.NewSession(session_id="s-reset", source="telegram"))
-        handle.sessions.end("s-reset", "session_reset")
-        handle.sessions.create(sessions_mod.NewSession(session_id="s-exit", source="telegram"))
-        handle.sessions.end("s-exit", "user_exit")
-        gateway = _Gw(_session_db=handle)
+        def __getattr__(self, name):
+            raise AssertionError(f"plugin reached into core session storage ({name})")
 
-        plugin._relabel_end_reason(gateway, "s-reset", "daily")
-        plugin._relabel_end_reason(gateway, "s-exit", "daily")
+    gw._session_db = _CoreSessionDB()
+    event = SimpleNamespace(source=_real_source(), internal=False)
+    policy = {"mode": "idle", "idle_minutes": 60}
+    with mock.patch.object(plugin, "_read_session_reset_policy", return_value=policy):
+        assert _run(plugin._maybe_reset(event, gw, store)) is None
 
-        assert handle.sessions.get("s-reset").end_reason == "daily"
-        assert handle.sessions.get("s-exit").end_reason == "user_exit"
-    finally:
-        handle.close()
+    assert store.lookup_by_session_key(key).session_id != "seed-sid"  # rotated, through the funnel
 
 
 # ---------------------------------------------------------------------------
